@@ -72,9 +72,13 @@ python3 analysis_template.py BTC ETH
 | 产物 | 位置 | 格式 | 说明 |
 |------|------|------|------|
 | K线数据库 | `okx_klines.db` | SQLite | 5m/15m/30m/1H/4H/1D/1W |
-| 分析缓存 | `analyses.json` | JSON数组 | 每次分析追加一条记录（同日同币覆盖） |
+| 分析缓存 | `analyses.json` | JSON数组 | flat_old（纯分析，analysis_template.py写入） |
+| 社交分析缓存 | `social_analyses.json` | JSON数组 | full_obj（社交发布，publish_social.py写入）。详见 social-posting-workflow skill 的 `references/two-file-architecture.md` |
 | 宏观缓存 | `.regime_cache.json` | JSON | 复用于BTC/ETH，3小时有效期 |
-| 终端输出 | stdout | 文本 | 关键指标汇总（供快速浏览） |
+
+> ⚠️ `analyses.json` 和 `social_analyses.json` 已分离（2026-06-20）。`process_reviews.py` 复盘引擎同时读取两个文件合并，social 优先覆盖同日同币记录。
+
+**统一计算层（2026-06-20 重构）**：`_social_publish.py` 的 `analyze_single_coin()` 改为 wrapper，底层统一调用 `analysis_template.analyze_single_coin()`。所有底层计算函数（RSI/MACD/ADX/BB/trend/label/accel/resonance 等 18 个核心字段）由 `analysis_template` 一站式提供，`_social_publish` 在此基础上补充 position/vp/wyckoff/calendar/macro 五个社交字段。两个工作流产出的分析数据从根源一致。
 
 ---
 
@@ -107,7 +111,7 @@ python3 analysis_template.py BTC ETH
 | 威科夫阶段 | `wyckoff_data.phase` | "Markup (Phase D→E)" |
 | 威科夫置信度 | `wyckoff_data.confidence` | 60/77 等百分比 |
 | Spring/SOS/LPS/SC | `kline_pattern_times` + `wyckoff_data.events` | **以 JSON 为准，不信 stdout** |
-| Volume Profile | `vp_data.POC`/`VAH`/`VAL`/`session` | |
+| VP POC/VAH/VAL | `vp_data.POC`/`VAH`/`VAL`（**24h 全天**，已改为全时段） | |
 | 订单流费率 | `order_flow.funding_rate_pct` | ETH/BTC 共用 regime_cache，值可以相同 |
 | 订单流Taker | `order_flow.taker_buy_ratio` | |
 | FG | `macro_external.fg_actual` | |
@@ -171,6 +175,23 @@ python3 analysis_template.py BTC ETH
 - 找不到出处的数字标注 `⚠️ 未核验`
 - K线形态以 JSON `kline_pattern_times` 为准（stdout 可能列出多余的 LPS）
 
+### 3.6 教训闭环（轻量）🔄 2026-06-20 新增
+
+**分析前必须加载教训上下文**：
+
+```bash
+cat /root/.hermes/trade_review/.lesson_context.txt
+```
+
+读取后，分析时注意：
+
+1. **同币种近期教训**：如 `.lesson_context.txt` 中有当前币种的教训，先复习
+2. **同行情类型教训**：如当前行情是「牛市回调」，关注 `[牛市回调]` 标签的教训
+3. **已知规律**：如 `RSI<20+FG<15 → 空头降级` 等已被多次验证的规则，直接应用
+4. **数据事件避让**：如临近 CPI/FOMC/非农，参考历史事件教训做方向降级
+
+该文件由 `inject_lessons.py`（cron `:05` 每小时）自动生成，源数据来自 `lessons.json` + `regimes/*_lessons.json`。
+
 ---
 
 ## 四、三层复盘引擎（自动）
@@ -213,3 +234,165 @@ for r in data[-10:]:
 | `process_reviews.py` | `trade_review/` | 三层复盘引擎 |
 | 分析报告模板v5.0.md | `obsidian-vault/2-分析框架/` | 分析报告输出模板 |
 | 社交动态模板v5.1.md | `obsidian-vault/2-分析框架/` | 发动态文案模板（不要与分析报告搞混） |
+
+## 六、仓位方向逻辑（`position` 字段）
+
+> 最后更新：2026-06-20 — P0/P1/P2/P3 仓位系统全量修复
+
+### 6.1 `position` 字段判定（写入 analyses.json）
+
+| 条件 | position 值 |
+|------|------------|
+| `resonance` 含 `强` 或 `near_bottom=True` | `偏多` |
+| `resonance` 含 `弱` | `偏空` |
+| `resonance` 含 `观望`/其他 | `观望（等确认）` |
+
+- 来源：`analysis_template.py` `analyze_single_coin()` + `_social_publish.py` wrapper（`analyze_single_coin` 返回值）
+- **2026-06-20 修复**：原逻辑 `'强' and not near_bottom → 偏多` 与 stdout 的 `near_bottom → 试多` 矛盾，已统一为 `near_bottom` 也触发偏多。
+
+### 6.2 stdout 仓位行判定（`_format_coin_section`）
+
+**判定优先级**（L1297-1320）：
+
+| 优先级 | 条件 | pos_dir |
+|--------|------|---------|
+| 1 | resonance 含 `强` 或 (near_bottom + MACD>-50 + RSI_1h<45) | `试多` |
+| 2 | resonance 含 `弱` 或 (RSI_1d>65 + MACD_4h<-50) | `试空` |
+| 3 | **near_top**：RSI_1d>67 + 1D方向='下降' + MACD_4h<0 | `试空` |
+| 4 | 其他 | `观望` |
+
+**V 反保护**（L3，L1309-1320）：做空信号确定后，如满足以下任一条件则降级为观望：
+- `near_bottom == True` → `观望（near_bottom保护）`
+- 过去 8 根 4H 蜡烛内，当前价从最低点反弹 > 3% → `观望（反弹X%，V反保护）`
+
+**多空 SL/TP**：
+- 做多：`SL = lows_near[0] - atr_4h × 0.5`，`TP = highs_near[0]`
+- 做空：`SL = highs_near[0] + atr_4h × 0.5`，`TP = lows_near[0]`
+- entry 用 `ticker.last`（现价）
+
+**pos_dir guard 规则**：所有后续判断使用 `pos_dir.startswith('试')` 和 `pos_dir.startswith('观望')` 而非等值比较，以兼容带后缀的变体（如 `观望（near_bottom保护）`）。
+
+### 6.3 仓位公式（`calc_position`）
+
+模块级常量（`analysis_template.py` L127-166）：
+
+| 常量 | 值 | 说明 |
+|------|-----|------|
+| `LEVERAGE` | 20 | 默认杠杆倍数 |
+| `ACCOUNT_USD` | 100 | 小账户本金 |
+| `MAX_RISK_PCT` | 2.0 | 单笔最大风险% |
+| `MARGIN_MAINTENANCE` | {BTC:0.5, ETH:1.0, SOL:2.0, DOGE:2.5} | OKX 维护保证金率% |
+| `CONTRACT_SIZE` | {BTC:0.01, ETH:0.1, SOL:1.0, DOGE:10.0} | 合约面值 |
+
+- **P2 修复**：`contracts` 已 `math.floor()` 取整（OKX 要求整张）
+- **P2 修复**：mm_map 补全 SOL(2.0%) / DOGE(2.5%)
+- **P3 新增**：输出行含 `爆仓价{liq_price:.1f}(距{liq_pct}%)`
+
+### 6.4 社交动态文案的 SL/TP
+
+`_social_publish.py` `generate_social_draft()` + `publish_social.py` fallback：
+
+- **P0 修复**：`_calc_sl_tp_pair()` 方向感知——做空 SL 在高位上方、TP 在低位
+- **P1b 修复**：SL 改用 ATR 缓冲（`indicators[4H].atr`），不再用硬编码 `0.99/0.985`
+- **P3 修复**：方向标签读 `position` 字段动态切换，不再硬编码 `偏多`
+- **f1 修复**：结语根据 `btc_dir_label` 动态切换——偏空→"顺势而为不猜底"；偏多+极恐→保留原句；观望→"等确认信号"
+- **f2 修复**：`btc_dir_label='观望'` 时不输出 🎯 行（避免无意义 SL/TP）
+- **f3 修复**：RR 警告阈值统一为 1.5（与分析报告一致）
+- `analyze_single_coin` 返回值新增 `position` 字段（L464）
+- `publish_social.py` fallback record 新增 `position` 字段
+
+### 6.5 B3/B4/X1 压制规则（⚠️ 仅文档，代码未执行）
+
+`BTC_RULES` 配置字典（L66-71）中记录了 B3/B4 规则，但**没有任何代码引用它们**：
+- `B3`: `bias≤-2+FG<15 → 不给出做空建议` — **未执行**
+- `B4`: `RSI<20+FG<15 → 空头信号强制降级` — **未执行**
+- `X1`: `check_extreme_oversold()`（L100-104）存在但**仅写 lessons_warnings，不干预 direction**
+
+⚠️ **关键认识**：做空稀少不是因为 B3 封杀，而是因为共振评分门槛（见 6.7）。当 resonance='🔴偏弱' 时，做空信号**确实会被输出**（ETH 6/19-20 已验证）。
+
+### 6.6 踩过的坑
+
+| 坑 | 表现 | 根因 | 修复 |
+|----|------|------|------|
+| SL/TP 不区分多空 | 做空时 SL 仍在低位下方 | L1302-1303 始终 `sl=lows[0]-ATR×0.5` | P0：按 pos_dir 分支 |
+| entry 用日线收盘价 | 入场价可能已过时数小时 | L1301 `entry=close_1d` | P1a：改用 `ticker.last` |
+| 社交 SL 硬编码系数 | 波动大时止损太紧、波动小时太宽 | `low×0.99` | P1b：改用 ATR 缓冲 |
+| contracts 不取整 | 输出小数张数 | calc_position 无 floor | P2：`math.floor()` |
+| SOL/DOGE 爆仓距偏低 | mmr 默认 1.5% 与 OKX 实际不符 | mm_map 缺 SOL/DOGE | P2：补全 MARGIN_MAINTENANCE |
+| JSON position 与 stdout 矛盾 | near_bottom 在 JSON 抑制偏多、在 stdout 触发试多 | 两套独立判定逻辑 | P3：统一为 near_bottom 触发偏多/试多 |
+| 社交结语与做空矛盾 | 输出做空建议时结语说"做空的都成了燃料" | L597 结语硬编码 | f1：根据方向动态切换 |
+| 观望时显示假 SL/TP | 观望无交易计划但 🎯 行仍有数字 | `_calc_sl_tp_pair` 走 else 默认算做多 | f2：观望时跳过输出 |
+| close_1d 死变量 | 已改用 ticker.last 但 close_1d 仍被计算 | L1301 未删除 | f4：删除变量 |
+| 做空入口稀缺 | 震荡市几乎不出做空信号 | 共振门槛 2/3 + 做空无捷径 | L1：加 near_top 检测 |
+| FG<15 一刀切假设 | V 反恐惧与阴跌恐惧不分 | 无趋势/反弹上下文 | L3：near_bottom+反弹检测做 V 反保护 |
+| 教训静默丢失 | `extract_lessons()` 应生成教训但返回空 | `find_analysis()` 因 analyses.json 被 publish_social 覆盖返回 None → analysis is None → 提前 return [] | 分离 analyses.json/social_analyses.json（2026-06-20）|
+| VP 开盘为空 | `session_vp()` 新交易时段前2h无数据 | 仅查当前8h时段15m蜡烛（≥8根才计算） | 改为24h全天（2026-06-20）|
+| 日历缓存过期 | 日常为空（cron 6h刷新间隔太长） | 仅读本地缓存文件 | 改为 MCP 实时+缓存+硬编码回退（2026-06-20）|
+| 底层函数重复实现 | 13/22 核心字段不一致，复盘取到不同源数据 | `_social_publish.py` 11 个函数有独立副本，与 `analysis_template` 实现不同 | 全量从 `analysis_template` import，`analyze_single_coin` 改为 wrapper（2026-06-20）|
+### 6.7 共振评分公式（`resonance` 如何决定做空/做多）
+
+`analysis_template.py` `analyze_single_coin()`：
+
+```
+score = 0
+RSI_4H > 55  → +1    |  RSI_4H < 45  → -1
+MACD_h_4H > 0 → +1   |  MACD_h_4H < 0 → -1
+%b_1H < 30   → -1    |  %b_1H > 70   → +1
+
+score ≥  2 → 🟢偏强 → position='偏多'
+score ≤ -2 → 🔴偏弱 → position='偏空'
+其他       → 🟡分歧 → position='观望（等确认）'
+```
+
+**2026-06-20 L1 优化**：做空增加 **near_top 捷径**（跳过共振门槛，直接触发偏空）：
+```
+RSI_1d > 67 + 1D方向='下降' + MACD_h_4H < 0 → position='偏空'/'试空'
+```
+该逻辑在 `_format_coin_section`（stdout）和 `analyze_single_coin`（JSON）两处均有实现，同时 V 反保护（near_bottom/反弹>3%）会在做空触发后降级为观望。
+
+> 📊 数据验证（2026-06-19/20）：4 条有 resonance 的记录中，ETH 2 次🔴偏弱、BTC 2 次🟡分歧。
+
+### 6.8 已知局限 & 待改进
+
+| 局限 | 影响 | 状态 |
+|------|------|------|
+| 共振门槛 2/3 | 做空信号仍偏少（需至少 2 指标偏空） | 🟡 已部分缓解：near_top 提供额外入口 |
+| FG<15 上下文区分 | V 反恐惧 vs 阴跌恐惧目前通过 near_bottom/反弹检测区分 | ✅ 已实现：L3 V 反保护 |
+| 做空入口 | 此前无 near_bottom 等价捷径 | ✅ 已实现：L1 near_top |
+| 社交动态方向标签硬编码 | 此前始终输出 偏多 | ✅ 已修复：读 position 字段动态切换 |
+
+### 6.9 MACD_4H vs MACD_1H 设计决策
+
+**为什么用 4H 而非 1H**（2026-06-20 数据验证）：
+
+近 4 条记录中，4H MACD 和 1H MACD **100% 方向冲突**：
+```
+BTC: 4H=空(-535)  1H=多(+154)  ⚡
+ETH: 4H=空(-16)   1H=多(+2)    ⚡
+```
+
+1H MACD 在下跌通道中频繁翻红（日内反弹），用 1H 判断方向会导致：
+- `near_top` 条件 `MACD<0` 永不触发
+- 共振评分 MACD 项从 -1 变 +1
+- **做空信号更少**（与优化目标相反）
+
+**结论**：4H MACD 保持不变。对应持有周期（6h-72h 复盘窗口），滤掉日内噪声。
+
+### 6.10 教训系统现状（2026-06-20 更新）
+
+- `process_reviews.py` 有 `extract_lessons()` 函数和 `save_lessons_regime_aware()` 写入
+- `lessons.json` + `regimes/{regime}_lessons.json` 双轨存储
+- **2026-06-20 门槛调整**：之前仅在评分=-1 时触发 → 现在 `total ≤ 1`（即 +2/+3 才跳过）。新增四类中性教训：「方向未确认」「信号未确认」「价位误判」「价位未触及」
+- **轻量闭环已上线**：`inject_lessons.py`（cron :05）刷新 `.lesson_context.txt`，`§3.6` 强制分析前加载
+- **无权重反馈**：教训系统是存档+上下文注入，不反馈到 `resonance` 评分权重（重量闭环待 2026-07-20 讨论）
+- **重型闭环设计**：详见 [references/weight-adjustment-framework.md](references/weight-adjustment-framework.md)，计划 2026-07-20 根据累计数据讨论
+
+## 七、相关技能
+
+| 技能 | 关系 |
+|------|------|
+| `social-posting-workflow` | 📖 发动态操作手册（分析结论消费方） |
+| `social-dynamic` | 社交动态发布自动化 skill |
+| `trade-review-workflow` | 三层复盘引擎（消费 analyses.json） |
+| `analysis-strict-output` | 分析输出核验纪律 |
+| `analysis-template` | 分析模板规范 |
