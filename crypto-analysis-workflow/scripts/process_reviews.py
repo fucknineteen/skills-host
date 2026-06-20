@@ -12,11 +12,11 @@ import sys
 import re
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
-from _shared import BJT, DB_PATH as _SHARED_DB_PATH, TRADE_DIR, classify_price_path, get_klines
+from _shared import BJT, DB_PATH as _SHARED_DB_PATH, TRADE_DIR, classify_price_path, get_klines, SOCIAL_ANALYSES_PATH
 
 DB_PATH = _SHARED_DB_PATH
 REVIEWS_PATH = f'{TRADE_DIR}/reviews.json'
-ANALYSES_PATH = f'{TRADE_DIR}/analyses.json'
+ANALYSES_PATH = f'{TRADE_DIR}/analyses.json'          # flat_old: analysis_template.py
 LESSONS_PATH = f'{TRADE_DIR}/lessons.json'
 REGIME_DIR = f'{TRADE_DIR}/regimes'
 
@@ -775,6 +775,25 @@ def main():
             analyses = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         analyses = []
+    
+    # Also load social_analyses.json and merge (social records take priority for same coin+date)
+    try:
+        with open(SOCIAL_ANALYSES_PATH, 'r') as f:
+            social_analyses = json.load(f)
+        # Merge: social entries appended; dedup by (coin, date) where social wins
+        social_keys = set()
+        for sa in social_analyses:
+            ts = parse_timestamp(sa.get('timestamp', ''))
+            if ts:
+                social_keys.add((sa.get('coin', ''), ts.strftime('%Y-%m-%d')))
+        # Remove duplicate records from analyses that also appear in social
+        analyses = [a for a in analyses if (
+            (ts := parse_timestamp(a.get('timestamp', ''))) and 
+            (a.get('coin', ''), ts.strftime('%Y-%m-%d')) not in social_keys
+        )]
+        analyses.extend(social_analyses)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
     
     try:
         with open(LESSONS_PATH, 'r') as f:

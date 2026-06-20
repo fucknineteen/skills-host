@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-社交动态数据核验器 v4 — 数据源驱动：从 analyses.json 读真值，反向验证文案。
+社交动态数据核验器 v4 — 数据源驱动：从 social_analyses.json 读真值，反向验证文案。
 用法: python3 verify_social_post.py "动态文案"
       从 stdin: echo "post text" | python3 verify_social_post.py -
 """
@@ -8,7 +8,7 @@ import subprocess, sys, re, json, os
 from datetime import datetime, timezone, timedelta
 from _shared import BJT
 
-ANALYSES_FILE = '/root/.hermes/trade_review/analyses.json'
+ANALYSES_FILE = '/root/.hermes/trade_review/social_analyses.json'
 ANALYSIS_SCRIPT = '/root/.hermes/trade_review/analysis_template.py'
 MAX_AGE_MIN = 120  # 分析记录最大允许年龄（分钟）
 

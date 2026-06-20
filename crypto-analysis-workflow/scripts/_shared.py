@@ -6,6 +6,7 @@ import re
 BJT = timezone(timedelta(hours=8), 'Asia/Shanghai')
 TRADE_DIR = '/root/.hermes/trade_review'
 DB_PATH = f'{TRADE_DIR}/okx_klines.db'
+SOCIAL_ANALYSES_PATH = f'{TRADE_DIR}/social_analyses.json'  # publish_social.py full_obj 格式
 
 
 def get_klines(db, coin_raw, timeframe, since_ts_ms, until_ts_ms=None, limit=200):

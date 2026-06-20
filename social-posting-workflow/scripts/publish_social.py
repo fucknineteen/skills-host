@@ -225,8 +225,8 @@ def main():
     t.join()
     print(f'  ✅ 分析+宏观并行完成')
 
-    # 从 analyses.json 读取分析结果
-    analyses_file = os.path.join(_TRADE_DIR, 'analyses.json')
+    # 从 social_analyses.json 读取分析结果（full_obj 格式）
+    analyses_file = os.path.join(_TRADE_DIR, 'social_analyses.json')
     analyses = []
     if os.path.exists(analyses_file):
         with open(analyses_file) as f:
@@ -270,9 +270,9 @@ def main():
     # Step 3: 复盘
     review_text = step_review()
 
-    # If we generated fresh analyses via fallback, write them to analyses.json for verification
+    # If we generated fresh analyses via fallback, write them to social_analyses.json for verification
     if has_saved_analyses:
-        analyses_file = os.path.join(_TRADE_DIR, 'analyses.json')
+        analyses_file = os.path.join(_TRADE_DIR, 'social_analyses.json')
         lock_file = analyses_file + '.lock'
         try:
             # 获取文件锁（最多等待 10 秒）
@@ -368,9 +368,9 @@ def main():
                 })
             with open(analyses_file, 'w') as f:
                 json.dump(merged, f, indent=2, ensure_ascii=False)
-            print(f'  ✅ 已更新 analyses.json（完整对象格式）')
+            print(f'  ✅ 已更新 social_analyses.json（完整对象格式）')
         except Exception as e:
-            print(f'  ⚠️ 写入 analyses.json 失败: {e}')
+            print(f'  ⚠️ 写入 social_analyses.json 失败: {e}')
         finally:
             try:
                 os.close(lock_fd)
