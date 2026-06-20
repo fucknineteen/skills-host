@@ -176,6 +176,21 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
     result['wyckoff_data'] = wyckoff_detect(result_dict) or {}
     # kline_patterns 已在 _base_analyze 中计算，不覆盖
     result['calendar_events'] = get_jin10_key_events()
+
+    # 快讯 — 2026-06-20 新增
+    flash_news = []
+    try:
+        from jin10_fallback import fetch_flash_news as _fetch_flash
+        flash_items, flash_source, flash_fresh = _fetch_flash()
+        for item in flash_items[:8]:
+            flash_news.append({
+                'time': item.get('time', ''),
+                'content': item.get('content', ''),
+                'score': item.get('relevance_score', 0),
+            })
+    except Exception:
+        pass
+    result['flash_news'] = flash_news
     
     # macro 数据（从 regime_cache，含 DXY/VIX/10Y/BTC.D）
     macro_external = {}
@@ -270,6 +285,20 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
     else:
         macd_summary = 'MACD待确认'
     lines.append(f'📐 结构：{regime}(置信度{confidence}%)。{macd_summary}')
+
+    # 📰 快讯 — 2026-06-20 新增
+    flash_items = btc.get('flash_news', [])
+    if flash_items:
+        top_flash = sorted(flash_items, key=lambda x: x.get('score', 0), reverse=True)[:3]
+        flash_lines = []
+        for fi in top_flash:
+            content = fi.get('content', '')
+            if len(content) > 80:
+                content = content[:77] + '...'
+            flash_lines.append(f'  · {content}')
+        if flash_lines:
+            lines.append(f'📰 快讯：')
+            lines.extend(flash_lines)
 
     # 支撑阻力
     lines.append(f'')

@@ -1281,7 +1281,7 @@ def _format_coin_section(a):
         poc_s = f'${svp["poc"]:.4f}' if svp['poc'] < 1 else (f'${svp["poc"]:.2f}' if svp['poc'] < 100 else f'${svp["poc"]:.0f}')
         vah_s = f'${svp["vah"]:.4f}' if svp['vah'] < 1 else (f'${svp["vah"]:.2f}' if svp['vah'] < 100 else f'${svp["vah"]:.0f}')
         val_s = f'${svp["val"]:.4f}' if svp['val'] < 1 else (f'${svp["val"]:.2f}' if svp['val'] < 100 else f'${svp["val"]:.0f}')
-        lines.append(f'📊 {svp["session"]}时段VP: POC={poc_s} | VAH={vah_s} | VAL={val_s} ({svp["bars"]}bar)')
+        lines.append(f'📊 {svp.get("hours", "24")}h时段VP: POC={poc_s} | VAH={vah_s} | VAL={val_s} ({svp.get("bars", "?")}bar)')
     rsi_1d = ind['1D'].get('rsi', 50)
     rsi_1h_val = a.get('rsi_1h', 50)
     macd_4h_val = a.get('macd_h_4h', 0)
@@ -1624,6 +1624,19 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
     else:
         macro_summary = f'FG={fg_val} {fg_label}'
     lines.append(f'🌍 宏观：{macro_summary}')
+    # 📰 快讯（取前3条高关联度）— 2026-06-20 新增
+    flash_items = btc.get('flash_news', [])
+    if flash_items:
+        top_flash = sorted(flash_items, key=lambda x: x.get('score', 0), reverse=True)[:3]
+        flash_lines = []
+        for fi in top_flash:
+            content = fi.get('content', '')
+            if len(content) > 80:
+                content = content[:77] + '...'
+            flash_lines.append(f'  · {content}')
+        if flash_lines:
+            lines.append(f'📰 快讯：')
+            lines.extend(flash_lines)
     lines.append(f'\\n📍 BTC 支撑 {s_btc} | 阻力 {r_btc}')
     lines.append(f'📍 ETH 支撑 {s_eth} | 阻力 {r_eth}')
     try: btc_entry_f = float(btc_p) if btc_p != '?' else 0
@@ -1997,7 +2010,23 @@ def main():
                                     calendar_events.append(f"{item.get('time', '')} {item['title']}")
             except Exception:
                 pass
-            
+
+            # Fetch flash news (快讯) — 2026-06-20 新增
+            flash_news = []
+            try:
+                from jin10_fallback import fetch_flash_news as _fetch_flash
+                flash_items, flash_source, flash_fresh = _fetch_flash()
+                # 转换为简洁格式: [{time, content, score}, ...]
+                for item in flash_items[:10]:
+                    flash_news.append({
+                        'time': item.get('time', ''),
+                        'content': item.get('content', ''),
+                        'score': item.get('relevance_score', 0),
+                        'url': item.get('url', ''),
+                    })
+            except Exception:
+                pass
+
             # Extract VP data
             vp_data = {}
             if 'vp_POC' in a:
@@ -2156,6 +2185,8 @@ def main():
                 "macro_external": macro_external,
                 # Calendar events
                 "calendar_events": calendar_events,
+                # Flash news (快讯) — 2026-06-20 新增
+                "flash_news": flash_news,
                 # VP data
                 "vp_data": vp_data,
                 # Order flow
