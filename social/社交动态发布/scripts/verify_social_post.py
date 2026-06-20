@@ -89,7 +89,7 @@ def verify_structured(post_text, analyses):
         kt = rec.get('kline_table', {})
         k1h = kt.get('1H', {})
         k4h = kt.get('4H', {})
-        vp = rec.get('vp_data', {})
+        vp = rec.get('session_vp', {})
         me = rec.get('macro_external', {})
         wy = rec.get('wyckoff_data', {})
         pat = rec.get('kline_pattern_times', {})

@@ -1707,6 +1707,22 @@ def main():
                 pass
         
         new_review_count = 0
+        
+        # 快讯: 循环外拉取一次，多币种共享 (2026-06-20 优化)
+        _all_flash_news = []
+        try:
+            from jin10_fallback import fetch_flash_news as _fetch_flash
+            flash_items, flash_source, flash_fresh = _fetch_flash()
+            for item in flash_items[:10]:
+                _all_flash_news.append({
+                    'time': item.get('time', ''),
+                    'content': item.get('content', ''),
+                    'score': item.get('relevance_score', 0),
+                    'url': item.get('url', ''),
+                })
+        except Exception:
+            pass
+        
         for a in analyses:
             coin_key = f"{a['coin']}USDT"
             date_key = NOW_BJ.strftime('%Y-%m-%d')
@@ -1725,31 +1741,37 @@ def main():
             trend_1d = ind.get('1D', {}).get('trend', '')
             f_rate = a.get('funding', {})
             f_rate_val = f_rate.get('rate', '') if not f_rate.get('_error') else ''
-            # Compute sl/tp/rr from levels_4h (full_obj format)
+            # Compute sl/tp/rr from levels_4h (full_obj format) — 区分多空
             levels_4h = a.get('levels_4h', {})
             lows = levels_4h.get('lows', [])
             highs = levels_4h.get('highs', [])
             entry_p = a.get('ticker', {}).get('last', 0)
             try: entry_f = float(entry_p) if entry_p and entry_p != '?' else 0
             except: entry_f = 0
+            position = a.get('position', '观望')
             
-            # BTC: SL = lowest_low * 0.99, TP = highest_high
-            # ETH: SL = lowest_low * 0.985, TP = highest_high
-            if a['coin'] == 'BTC':
-                sl_mult = 0.99
-                tp_mult = 1.0
+            if '空' in str(position):
+                # 做空: SL在阻力上方(highs[0]*1.01), TP在支撑(lows[0])
+                sl_val = int(highs[0] * 1.01) if highs and entry_f else 0
+                tp_val = int(lows[0]) if lows else 0
+                rr_str = '?'
+                if entry_f and sl_val and tp_val and sl_val > entry_f:
+                    rr = round((entry_f - tp_val) / (sl_val - entry_f), 1)
+                    rr_str = f'{rr:.1f}' if rr > 0 else '?'
             else:
-                sl_mult = 0.985
-                tp_mult = 1.0
-            
-            sl_val = int(lows[0] * sl_mult) if lows and entry_f else 0
-            tp_val = int(highs[0] * tp_mult) if highs else 0
-            
-            # Compute RR
-            rr_str = '?'
-            if entry_f and sl_val and tp_val and entry_f > sl_val:
-                rr = round((tp_val - entry_f) / (entry_f - sl_val), 1)
-                rr_str = f'{rr:.1f}' if rr > 0 else '?'
+                # 做多: SL在支撑下方, TP在阻力 (保留原逻辑)
+                if a['coin'] == 'BTC':
+                    sl_mult = 0.99
+                    tp_mult = 1.0
+                else:
+                    sl_mult = 0.985
+                    tp_mult = 1.0
+                sl_val = int(lows[0] * sl_mult) if lows and entry_f else 0
+                tp_val = int(highs[0] * tp_mult) if highs else 0
+                rr_str = '?'
+                if entry_f and sl_val and tp_val and entry_f > sl_val:
+                    rr = round((tp_val - entry_f) / (entry_f - sl_val), 1)
+                    rr_str = f'{rr:.1f}' if rr > 0 else '?'
             
             # Extract per-TF indicators for complete data storage
             ind = a.get('indicators', {})
@@ -1874,21 +1896,8 @@ def main():
             except Exception:
                 pass
 
-            # Fetch flash news (快讯) — 2026-06-20 新增
-            flash_news = []
-            try:
-                from jin10_fallback import fetch_flash_news as _fetch_flash
-                flash_items, flash_source, flash_fresh = _fetch_flash()
-                # 转换为简洁格式: [{time, content, score}, ...]
-                for item in flash_items[:10]:
-                    flash_news.append({
-                        'time': item.get('time', ''),
-                        'content': item.get('content', ''),
-                        'score': item.get('relevance_score', 0),
-                        'url': item.get('url', ''),
-                    })
-            except Exception:
-                pass
+            # Fetch flash news (快讯) — 2026-06-20 新增 (循环外拉取一次，多币种共享)
+            flash_news = _all_flash_news
 
             # Extract VP data
             vp_data = {}

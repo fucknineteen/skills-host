@@ -215,7 +215,7 @@ def main():
         if i < len(coins) - 1:
             time.sleep(1)
     conn.close()
-    has_saved_analyses = True
+    has_saved_analyses = len(analyses) > 0
 
     # Step 3: 复盘
     review_text = step_review()
@@ -302,7 +302,7 @@ def main():
                     'macd_h_4h': a['macd_h_4h'],
                     'macd_h_1h': a['macd_h_1h'],
                     'pct_b': a['pct_b'],
-                    'vp_data': a.get('vp_data', {}),
+                    'session_vp': a.get('session_vp', {}),
                     'wyckoff_data': a.get('wyckoff_data', {}),
                     'kline_patterns': a.get('kline_patterns', []),
                     'calendar_events': a.get('calendar_events', []),
@@ -336,7 +336,8 @@ def main():
             print(f'  ⚠️ 写入 social_analyses.json 失败: {e}')
         finally:
             try:
-                os.close(lock_fd)
+                if lock_fd is not None:
+                    os.close(lock_fd)
                 os.unlink(lock_file)
             except Exception:
                 pass

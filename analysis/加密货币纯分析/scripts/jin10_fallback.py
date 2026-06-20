@@ -449,9 +449,10 @@ def fetch_flash_news():
     # 1. 尝试 MCP 实时
     session, err = _jin10_mcp_session()
     if session:
+        all_items = {}
+        
+        # 拉取最新 2 页 (独立try块)
         try:
-            all_items = {}
-            # 拉取最新 2 页
             cursor = ""
             for _ in range(2):
                 items, next_cursor, ferr = try_jin10_flash_paginate(session, cursor)
@@ -474,8 +475,11 @@ def fetch_flash_news():
                 if not next_cursor:
                     break
                 cursor = next_cursor
+        except Exception:
+            pass
 
-            # 搜索高优先级关键词
+        # 搜索高优先级关键词 (独立try块，不影响分页结果)
+        try:
             for kw in ["美联储", "比特币", "以太坊", "加密货币", "BTC"]:
                 s_items, serr = try_jin10_search_flash(session, kw)
                 if serr:
@@ -493,7 +497,11 @@ def fetch_flash_news():
                         score = _flash_relevance_score(item) + 2  # 搜索命中加分
                         if score > 0:
                             all_items[url] = {**item, "relevance_score": score}
+        except Exception:
+            pass
 
+        # 有结果才继续
+        if all_items:
             # 排序：关联度降序，取前 15
             sorted_items = sorted(all_items.values(), key=lambda x: x.get("relevance_score", 0), reverse=True)[:15]
 
@@ -510,8 +518,6 @@ def fetch_flash_news():
                 json.dump(cache, f, indent=2, ensure_ascii=False)
 
             return sorted_items, "jin10_live", True
-        except Exception as e:
-            pass
 
     # 2. 读缓存
     if os.path.exists(FLASH_CACHE_PATH):

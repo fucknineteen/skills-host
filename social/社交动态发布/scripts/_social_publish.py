@@ -172,7 +172,7 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
         'accel': result['accel'], 'near_bottom': near_bottom,
         'resonance': resonance, 'risks': result.get('risks', []),
     }
-    result['vp_data'] = session_vp(coin, conn) or {}
+    result['session_vp'] = session_vp(coin, conn) or {}
     result['wyckoff_data'] = wyckoff_detect(result_dict) or {}
     # kline_patterns 已在 _base_analyze 中计算，不覆盖
     result['calendar_events'] = get_jin10_key_events()
