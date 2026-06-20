@@ -18,16 +18,21 @@ except ImportError:
     sys.path.insert(0, _TRADE_DIR)
     from _shared import BJT
 
-# ── 从 analysis_template.py 导入威科夫/VP/形态/日历函数 ──────────
-from analysis_template import session_vp, wyckoff_detect, detect_kline_patterns, get_jin10_key_events
-
-# ── MACD 参数 ─────────────────────────────────────────────
-MACD_PARAMS = {
-    'BTC': (12, 75, 9),
-    'ETH': (12, 75, 9),
-    'SOL': (12, 75, 9),
-    'DOGE': (12, 75, 9),
-}
+# ── 从 analysis_template.py 导入所有分析函数（统一底层实现）──────────
+from analysis_template import (
+    session_vp, wyckoff_detect, detect_kline_patterns, get_jin10_key_events,
+    # 指标计算
+    is_closed, calc_rsi, calc_macd, calc_adx, calc_bollinger, calc_obv,
+    # K线 / 趋势 / 风控
+    candle_body_label, trend_direction, check_acceleration,
+    check_extreme_oversold, check_data_event_window,
+    # 数据库查询
+    get_rows, build_data_freshness,
+    # 主分析函数
+    analyze_single_coin as _base_analyze,
+    # 常量
+    MACD_PARAMS, TIMEFRAMES,
+)
 
 # ── 重试 ──────────────────────────────────────────────────
 def _retry(fn, max_retries=5, delay=1.5):
