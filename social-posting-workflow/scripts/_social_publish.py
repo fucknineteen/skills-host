@@ -311,13 +311,17 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
     eth_dir_label = '偏多' if '多' in str(eth_pos) else ('偏空' if '空' in str(eth_pos) else '观望')
     
     lines.append(f'')
-    # 观望时不输出 SL/TP 行
+    # 观望时输出提示，有方向时输出 SL/TP
     if btc_dir_label != '观望' and btc_entry_f and btc_sl_val and btc_tp_val:
         rr_warn_btc = ' ⚠️' if btc_rr_str != '?' and float(btc_rr_str) < 1.5 else ''
         lines.append(f'🎯 BTC {btc_dir_label} | 入场{int(btc_entry_f):,} | 止损{btc_sl_val:,} | 止盈{btc_tp_val:,} | RR 1:{btc_rr_str}{rr_warn_btc}')
+    elif btc_dir_label == '观望':
+        lines.append(f'🎯 BTC 观望 | 多看少动')
     if eth_dir_label != '观望' and eth_entry_f and eth_sl_val and eth_tp_val:
         rr_warn_eth = ' ⚠️' if eth_rr_str != '?' and float(eth_rr_str) < 1.5 else ''
         lines.append(f'🎯 ETH {eth_dir_label} | 入场{eth_entry_f:.0f} | 止损{eth_sl_val} | 止盈{eth_tp_val} | RR 1:{eth_rr_str}{rr_warn_eth}')
+    elif eth_dir_label == '观望':
+        lines.append(f'🎯 ETH 观望 | 多看少动')
 
     # 结语 — 根据 BTC 方向动态切换
     lines.append(f'')
