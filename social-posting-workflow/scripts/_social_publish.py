@@ -316,12 +316,12 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
         rr_warn_btc = ' ⚠️' if btc_rr_str != '?' and float(btc_rr_str) < 1.5 else ''
         lines.append(f'🎯 BTC {btc_dir_label} | 入场{int(btc_entry_f):,} | 止损{btc_sl_val:,} | 止盈{btc_tp_val:,} | RR 1:{btc_rr_str}{rr_warn_btc}')
     elif btc_dir_label == '观望':
-        lines.append(f'🎯 BTC 观望 | 多看少动')
+        lines.append(f'🎯 BTC 观望 | 空仓等风')
     if eth_dir_label != '观望' and eth_entry_f and eth_sl_val and eth_tp_val:
         rr_warn_eth = ' ⚠️' if eth_rr_str != '?' and float(eth_rr_str) < 1.5 else ''
         lines.append(f'🎯 ETH {eth_dir_label} | 入场{eth_entry_f:.0f} | 止损{eth_sl_val} | 止盈{eth_tp_val} | RR 1:{eth_rr_str}{rr_warn_eth}')
     elif eth_dir_label == '观望':
-        lines.append(f'🎯 ETH 观望 | 多看少动')
+        lines.append(f'🎯 ETH 观望 | 空仓等风')
 
     # 结语 — 根据 BTC 方向动态切换
     lines.append(f'')
