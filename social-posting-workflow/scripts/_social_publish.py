@@ -469,8 +469,8 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
         'accel': accel, 'near_bottom': near_bottom,
         'resonance': resonance, 'risks': risks,
     }
-    vp_data = session_vp(coin, conn)
-    wyckoff_data = wyckoff_detect(result_dict)
+    vp_data = session_vp(coin, conn) or {}
+    wyckoff_data = wyckoff_detect(result_dict) or {}
     kline_patterns = detect_kline_patterns(result_dict)
     calendar_events = get_jin10_key_events()
     # 提取 macro 数据（从 regime_cache，含 DXY/VIX/10Y/BTC.D）
@@ -480,7 +480,8 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
         if os.path.exists(_REGIME_CACHE):
             with open(_REGIME_CACHE) as _f:
                 _rc = _json.load(_f)
-            macro_external = _rc.get('macro_external', {})
+            me = _rc.get('macro_external', {})
+            macro_external = me if isinstance(me, dict) else {}
     except Exception:
         pass
     

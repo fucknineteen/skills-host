@@ -224,6 +224,7 @@ def main():
     if has_saved_analyses:
         analyses_file = os.path.join(_TRADE_DIR, 'social_analyses.json')
         lock_file = analyses_file + '.lock'
+        lock_fd = None
         try:
             # 获取文件锁（最多等待 10 秒）
             for _ in range(20):
@@ -235,8 +236,14 @@ def main():
             else:
                 raise TimeoutError('获取文件锁超时')
             
-            with open(analyses_file, 'r') as f:
-                existing = json.load(f)
+            # 读取已有记录（首次创建时文件不存在 → 空列表）
+            try:
+                with open(analyses_file, 'r') as f:
+                    existing = json.load(f)
+            except FileNotFoundError:
+                existing = []
+            
+            # 去掉当天旧记录，追加新记录 + FG + REVIEW
             merged = [r for r in existing if not r.get('timestamp', '').startswith(NOW_BJ.strftime('%Y-%m-%d'))]
             
             # 保存 fg_val/fg_label 供写入记录
