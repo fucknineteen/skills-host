@@ -306,6 +306,7 @@ def main():
                     'wyckoff_data': a.get('wyckoff_data', {}),
                     'kline_patterns': a.get('kline_patterns', []),
                     'calendar_events': a.get('calendar_events', []),
+                    'flash_news': a.get('flash_news', []),
                     'macro_external': a.get('macro_external', {}),
                     # 计算字段（供核验使用）
                     'sl_val': sl_val,
