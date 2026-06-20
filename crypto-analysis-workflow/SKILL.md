@@ -64,8 +64,9 @@ python3 analysis_template.py BTC ETH
 | ⑦ | 道氏方向（1D/4H/1H） | 收盘价序列 |
 | ⑧ | 共振评级（🟢偏强/🟡分歧/🔴偏弱） | 多指标综合 |
 | ⑨ | 宏观环境（FG/DXY/VIX/10Y/BTC.D） | 金十MCP + alt.me + Yahoo |
-| ⑩ | 金十财经日历 | 金十MCP |
-| ⑪ | 写入 `analyses.json` | 本地文件 |
+| ⑩ | 金十财经日历 | 金十MCP `list_calendar` |
+| ⑪ | **金十快讯（🆕 2026-06-20）** | 金十MCP `list_flash` + `search_flash`（加密相关过滤，7天内，关联度排序） |
+| ⑫ | 写入 `analyses.json` | 本地文件 |
 
 ### 2.3 输出产物
 
@@ -78,7 +79,7 @@ python3 analysis_template.py BTC ETH
 
 > ⚠️ `analyses.json` 和 `social_analyses.json` 已分离（2026-06-20）。`process_reviews.py` 复盘引擎同时读取两个文件合并，social 优先覆盖同日同币记录。
 
-**统一计算层（2026-06-20 重构）**：`_social_publish.py` 的 `analyze_single_coin()` 改为 wrapper，底层统一调用 `analysis_template.analyze_single_coin()`。所有底层计算函数（RSI/MACD/ADX/BB/trend/label/accel/resonance 等 18 个核心字段）由 `analysis_template` 一站式提供，`_social_publish` 在此基础上补充 position/vp/wyckoff/calendar/macro 五个社交字段。两个工作流产出的分析数据从根源一致。
+**统一计算层（2026-06-20 重构）**：`_social_publish.py` 的 `analyze_single_coin()` 改为 wrapper，底层统一调用 `analysis_template.analyze_single_coin()`。所有底层计算函数（RSI/MACD/ADX/BB/trend/label/accel/resonance 等 18 个核心字段）由 `analysis_template` 一站式提供，`_social_publish` 在此基础上补充 position/vp/wyckoff/calendar/macro/flash_news 六个社交字段。两个工作流产出的分析数据从根源一致。
 
 ---
 
@@ -122,6 +123,7 @@ python3 analysis_template.py BTC ETH
 | BTC.D | `macro_external.btc_dominance` | |
 | 仓位方向 | `position` | "观望（等确认）"/做多/做空 |
 | 财经日历 | `calendar_events` | 仅列前3条 |
+| 快讯 | `flash_news` | `[{time, content, score, url}]` 关联度排序，前3-5条 |
 | 涨跌幅 | `change_pct` | `(last-open24h)/open24h` |
 
 ### 3.3 输出模板
@@ -144,6 +146,9 @@ python3 analysis_template.py BTC ETH
 
 🌍 宏观环境
 [FG/DXY/VIX/10Y/BTC.D 表格 + 关键事件]
+
+📰 消息面（🆕 2026-06-20）
+[金十快讯前3-5条，标注时间+关联度]
 
 --- Part 2 ---
 
@@ -232,8 +237,15 @@ for r in data[-10:]:
 | `monitor_and_sync.py` | `trade_review/` | K线同步 |
 | `okx_klines.db` | `trade_review/` | K线SQLite数据库 |
 | `process_reviews.py` | `trade_review/` | 三层复盘引擎 |
+| `jin10_fallback.py` | `trade_review/` | 金十数据源（日历+快讯）🆕 2026-06-20 |
+| 快讯架构文档 | `references/flash-news-architecture.md` | 关联度评分、黑名单、缓存、数据流 |
 | 分析报告模板v5.0.md | `obsidian-vault/2-分析框架/` | 分析报告输出模板 |
 | 社交动态模板v5.1.md | `obsidian-vault/2-分析框架/` | 发动态文案模板（不要与分析报告搞混） |
+
+## 六、已知数据问题
+
+- **ETH 缺少 1h/4h/1d 数据**（仅 5m/15m/30m 可用）→ 详见 [`references/eth-data-gap.md`](references/eth-data-gap.md)。分析时需在结论中注明数据局限性。
+- **快讯集成架构**：详见 [`references/flash-news-integration.md`](references/flash-news-integration.md)。
 
 ## 六、仓位方向逻辑（`position` 字段）
 
@@ -328,7 +340,8 @@ for r in data[-10:]:
 | 教训静默丢失 | `extract_lessons()` 应生成教训但返回空 | `find_analysis()` 因 analyses.json 被 publish_social 覆盖返回 None → analysis is None → 提前 return [] | 分离 analyses.json/social_analyses.json（2026-06-20）|
 | VP 开盘为空 | `session_vp()` 新交易时段前2h无数据 | 仅查当前8h时段15m蜡烛（≥8根才计算） | 改为24h全天（2026-06-20）|
 | 日历缓存过期 | 日常为空（cron 6h刷新间隔太长） | 仅读本地缓存文件 | 改为 MCP 实时+缓存+硬编码回退（2026-06-20）|
-| 底层函数重复实现 | 13/22 核心字段不一致，复盘取到不同源数据 | `_social_publish.py` 11 个函数有独立副本，与 `analysis_template` 实现不同 | 全量从 `analysis_template` import，`analyze_single_coin` 改为 wrapper（2026-06-20）|
+| 底层函数重复实现 | 13/22 核心字段不一致，复盘取到不同源数据 | `_social_publish.py` 11 个函数有独立副本，与 `analysis_template` 实现不同 | 全量从 `analysis_template` import，`analyze_single_coin` 改为 wrapper（2026-06-20） |
+
 ### 6.7 共振评分公式（`resonance` 如何决定做空/做多）
 
 `analysis_template.py` `analyze_single_coin()`：
@@ -392,7 +405,6 @@ ETH: 4H=空(-16)   1H=多(+2)    ⚡
 | 技能 | 关系 |
 |------|------|
 | `social-posting-workflow` | 📖 发动态操作手册（分析结论消费方） |
-| `social-dynamic` | 社交动态发布自动化 skill |
 | `trade-review-workflow` | 三层复盘引擎（消费 analyses.json） |
 | `analysis-strict-output` | 分析输出核验纪律 |
 | `analysis-template` | 分析模板规范 |
