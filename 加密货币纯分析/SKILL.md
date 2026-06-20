@@ -1,5 +1,5 @@
 ---
-name: crypto-analysis-workflow
+name: 加密货币纯分析
 description: 加密货币纯分析工作流。步骤：同步K线→执行analysis_template.py→从analyses.json逐项提取数据→按分析报告模板v5.0输出→标注来源。与大币种(标准分析模板)和山寨币(庄控分析模板)两套输出模板独立。
 ---
 
@@ -49,7 +49,7 @@ python3 analysis_template.py BTC ETH
 
 **支持币种**：BTC / ETH / SOL / DOGE（可一次分析多个）
 
-**什么是"纯分析" vs "发动态"**：本条命令只做纯技术分析，不生成社交文案。发动态需走 `publish_social.py`（详见 `social-posting-workflow` skill）。
+**什么是"纯分析" vs "发动态"**：本条命令只做纯技术分析，不生成社交文案。发动态需走 `publish_social.py`（详见 `社交动态发布` skill）。
 
 ### 2.2 脚本内部做的事（按顺序）
 
@@ -74,7 +74,7 @@ python3 analysis_template.py BTC ETH
 |------|------|------|------|
 | K线数据库 | `okx_klines.db` | SQLite | 5m/15m/30m/1H/4H/1D/1W |
 | 分析缓存 | `analyses.json` | JSON数组 | flat_old（纯分析，analysis_template.py写入） |
-| 社交分析缓存 | `social_analyses.json` | JSON数组 | full_obj（社交发布，publish_social.py写入）。详见 social-posting-workflow skill 的 `references/two-file-architecture.md` |
+| 社交分析缓存 | `social_analyses.json` | JSON数组 | full_obj（社交发布，publish_social.py写入）。详见 社交动态发布 skill 的 `references/two-file-architecture.md` |
 | 宏观缓存 | `.regime_cache.json` | JSON | 复用于BTC/ETH，3小时有效期 |
 
 > ⚠️ `analyses.json` 和 `social_analyses.json` 已分离（2026-06-20）。`process_reviews.py` 复盘引擎同时读取两个文件合并，social 优先覆盖同日同币记录。
@@ -404,7 +404,7 @@ ETH: 4H=空(-16)   1H=多(+2)    ⚡
 
 | 技能 | 关系 |
 |------|------|
-| `social-posting-workflow` | 📖 发动态操作手册（分析结论消费方） |
+| `社交动态发布` | 📖 发动态操作手册（分析结论消费方） |
 | `trade-review-workflow` | 三层复盘引擎（消费 analyses.json） |
 | `analysis-strict-output` | 分析输出核验纪律 |
 | `analysis-template` | 分析模板规范 |
