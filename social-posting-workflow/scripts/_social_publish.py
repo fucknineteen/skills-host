@@ -18,6 +18,9 @@ except ImportError:
     sys.path.insert(0, _TRADE_DIR)
     from _shared import BJT
 
+# ── 从 analysis_template.py 导入威科夫/VP/形态/日历函数 ──────────
+from analysis_template import session_vp, wyckoff_detect, detect_kline_patterns, get_jin10_key_events
+
 # ── MACD 参数 ─────────────────────────────────────────────
 MACD_PARAMS = {
     'BTC': (12, 75, 9),
@@ -459,6 +462,28 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
     if position_raw == '偏空' and near_bottom:
         position_raw = '观望（near_bottom保护）'
     
+    # ── 补全：威科夫 / Volume Profile / K线形态 / 日历 ──
+    result_dict = {
+        'coin': coin, 'close_status': close_status,
+        'levels_4h': levels_4h, 'indicators': indicators,
+        'accel': accel, 'near_bottom': near_bottom,
+        'resonance': resonance, 'risks': risks,
+    }
+    vp_data = session_vp(coin, conn)
+    wyckoff_data = wyckoff_detect(result_dict)
+    kline_patterns = detect_kline_patterns(result_dict)
+    calendar_events = get_jin10_key_events()
+    # 提取 macro 数据（从 regime_cache，含 DXY/VIX/10Y/BTC.D）
+    macro_external = {}
+    try:
+        import json as _json
+        if os.path.exists(_REGIME_CACHE):
+            with open(_REGIME_CACHE) as _f:
+                _rc = _json.load(_f)
+            macro_external = _rc.get('macro_external', {})
+    except Exception:
+        pass
+    
     return {
         'coin': coin,
         'ticker': ticker,
@@ -478,6 +503,12 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
         'macd_h_4h': macd_h_4h, 'macd_h_1h': macd_h_1h,
         'pct_b': pct_b,
         'lessons_warnings': lessons_warnings,
+        # 威科夫 / VP / 形态 / 日历（与 analysis_template.py 同步）
+        'vp_data': vp_data,
+        'wyckoff_data': wyckoff_data,
+        'kline_patterns': kline_patterns,
+        'calendar_events': calendar_events,
+        'macro_external': macro_external,
     }
 
 # ── 方向提取 ──────────────────────────────────────────────

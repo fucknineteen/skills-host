@@ -295,6 +295,11 @@ def main():
                     'macd_h_4h': a['macd_h_4h'],
                     'macd_h_1h': a['macd_h_1h'],
                     'pct_b': a['pct_b'],
+                    'vp_data': a.get('vp_data', {}),
+                    'wyckoff_data': a.get('wyckoff_data', {}),
+                    'kline_patterns': a.get('kline_patterns', []),
+                    'calendar_events': a.get('calendar_events', []),
+                    'macro_external': a.get('macro_external', {}),
                     # 计算字段（供核验使用）
                     'sl_val': sl_val,
                     'tp_val': tp_val,
