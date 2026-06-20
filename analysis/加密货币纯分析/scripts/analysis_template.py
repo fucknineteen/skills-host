@@ -1983,7 +1983,7 @@ def main():
                         macro_alert = str(lw)
                         break
             
-            # Extract position suggestion from resonance + near_bottom/near_top + V反保护
+            # Extract position suggestion from resonance + near_bottom/near_top + V反保护 (含8根4H反弹检测)
             position = a.get('position', '')
             if not position:
                 resonance = a.get('resonance', '')
@@ -1991,20 +1991,29 @@ def main():
                 rsi_1d = (a.get('indicators', {}).get('1D', {}).get('rsi') or 50)
                 trend_1d = a.get('indicators', {}).get('1D', {}).get('trend', '')
                 macd_4h = a.get('macd_h_4h', 0)
-                if '观望' in str(resonance):
-                    position = '观望'
-                elif '强' in str(resonance) or near_bottom:
+                if '强' in str(resonance) or near_bottom:
                     position = '偏多'
                 elif '弱' in str(resonance):
                     position = '偏空'
                 else:
                     position = '观望（等确认）'
                 # L1: near_top 做空捷径
-                if position == '观望' and rsi_1d > 67 and trend_1d == '下降' and macd_4h < 0:
+                if position == '观望（等确认）' and rsi_1d > 67 and trend_1d == '下降' and macd_4h < 0:
                     position = '偏空'
-                # L3: V反保护
-                if position == '偏空' and near_bottom:
-                    position = '观望（near_bottom保护）'
+                # L3: V反保护 — 底部区域/反弹中禁止做空 (与 _format_coin_section 对齐)
+                if position == '偏空':
+                    if near_bottom:
+                        position = '观望（near_bottom保护）'
+                    else:
+                        closed_4h = a.get('close_status', {}).get('4H', {}).get('closed', [])
+                        if closed_4h and len(closed_4h) >= 8:
+                            lows_8 = [r[3] for r in closed_4h[-8:]]
+                            min_low = min(lows_8)
+                            ticker = a.get('ticker', {})
+                            current = float(ticker.get('last', closed_4h[-1][4]))
+                            recovery_pct = (current - min_low) / min_low * 100 if min_low > 0 else 0
+                            if recovery_pct > 3:
+                                position = '观望（反弹{:.1f}%，V反保护）'.format(recovery_pct)
             
             # Extract macro_external from extra data (fallback if regime_result not available)
             if not macro_external and 'extra' in a:

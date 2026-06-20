@@ -128,10 +128,11 @@ def get_regime_result():
     return {'regime': '未知', 'confidence': 0, 'composite_score': 0}
 
 # ── 单币种完整分析 (wrapper) ─────────────────────────────────
-def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
+def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label, flash_news=None):
     """对单个币种执行完整分析。
     底层统一调用 analysis_template.analyze_single_coin，
-    在此基础上补充 position / vp / wyckoff / calendar / macro 五个社交专用字段。
+    在此基础上补充 position / vp / wyckoff / calendar / macro / flash_news 六个社交专用字段。
+    flash_news 可从外部预拉取传入（多币种共享），避免 per-coin 重复 MCP 调用。
     """
     
     # Fallback: 如果 API 返回错误，从 DB 读最新收盘价
@@ -155,14 +156,24 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
     macd_h_4h = result.get('macd_h_4h')
     near_bottom = result.get('near_bottom', False)
     
-    # 方向判定 — 共振 + near_top + V反保护
-    position_raw = '偏多' if '强' in str(resonance) else ('偏空' if '弱' in str(resonance) else '观望')
+    # 方向判定 — 共振 + near_top + V反保护 (含8根4H反弹检测)
+    position_raw = '偏多' if '强' in str(resonance) else ('偏空' if '弱' in str(resonance) else '观望（等确认）')
     # L1: near_top 做空捷径（trend_1d 为 analysis_template 格式：上升/下降/盘整）
-    if position_raw == '观望' and rsi_1d_val and rsi_1d_val > 67 and trend_1d == '下降' and macd_h_4h is not None and macd_h_4h < 0:
+    if position_raw == '观望（等确认）' and rsi_1d_val and rsi_1d_val > 67 and trend_1d == '下降' and macd_h_4h is not None and macd_h_4h < 0:
         position_raw = '偏空'
-    # L3: V反保护
-    if position_raw == '偏空' and near_bottom:
-        position_raw = '观望（near_bottom保护）'
+    # L3: V反保护 — 底部区域/反弹中禁止做空 (与 _format_coin_section 对齐)
+    if position_raw == '偏空':
+        if near_bottom:
+            position_raw = '观望（near_bottom保护）'
+        else:
+            closed_4h = result.get('close_status', {}).get('4H', {}).get('closed', [])
+            if closed_4h and len(closed_4h) >= 8:
+                lows_8 = [r[3] for r in closed_4h[-8:]]
+                min_low = min(lows_8)
+                current = float(ticker.get('last', closed_4h[-1][4]))
+                recovery_pct = (current - min_low) / min_low * 100 if min_low > 0 else 0
+                if recovery_pct > 3:
+                    position_raw = '观望（反弹{:.1f}%，V反保护）'.format(recovery_pct)
     result['position'] = position_raw
     
     # 威科夫 / Volume Profile / 日历 / 宏观
@@ -177,20 +188,23 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
     # kline_patterns 已在 _base_analyze 中计算，不覆盖
     result['calendar_events'] = get_jin10_key_events()
 
-    # 快讯 — 2026-06-20 新增
-    flash_news = []
-    try:
-        from jin10_fallback import fetch_flash_news as _fetch_flash
-        flash_items, flash_source, flash_fresh = _fetch_flash()
-        for item in flash_items[:8]:
-            flash_news.append({
-                'time': item.get('time', ''),
-                'content': item.get('content', ''),
-                'score': item.get('relevance_score', 0),
-            })
-    except Exception:
-        pass
-    result['flash_news'] = flash_news
+    # 快讯 — 2026-06-20 新增 (外部传入则复用，否则自行拉取)
+    if flash_news is not None:
+        result['flash_news'] = flash_news
+    else:
+        _flash = []
+        try:
+            from jin10_fallback import fetch_flash_news as _fetch_flash
+            flash_items, flash_source, flash_fresh = _fetch_flash()
+            for item in flash_items[:8]:
+                _flash.append({
+                    'time': item.get('time', ''),
+                    'content': item.get('content', ''),
+                    'score': item.get('relevance_score', 0),
+                })
+        except Exception:
+            pass
+        result['flash_news'] = _flash
     
     # macro 数据（从 regime_cache，含 DXY/VIX/10Y/BTC.D）
     macro_external = {}

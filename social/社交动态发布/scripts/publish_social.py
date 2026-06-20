@@ -199,6 +199,20 @@ def main():
     regime_result = get_regime_result()
     print(f'  ✅ FG={fg_val}({fg_label}), regime={regime_result.get("regime","?")}')
     
+    # 快讯: 循环外拉取一次，多币种共享
+    _shared_flash = []
+    try:
+        from jin10_fallback import fetch_flash_news as _ffn
+        _fi, _fs, _ff = _ffn()
+        for item in _fi[:8]:
+            _shared_flash.append({
+                'time': item.get('time', ''),
+                'content': item.get('content', ''),
+                'score': item.get('relevance_score', 0),
+            })
+    except Exception:
+        pass
+    
     conn = __import__('sqlite3').connect(DB_PATH)
     analyses = []
     for i, coin in enumerate(coins):
@@ -209,7 +223,7 @@ def main():
         t2 = threading.Thread(target=_ff)
         t1.start(); t2.start()
         t1.join(); t2.join()
-        a = analyze_single_coin(conn, coin, tres[0], fres[0], fg_val, fg_label)
+        a = analyze_single_coin(conn, coin, tres[0], fres[0], fg_val, fg_label, flash_news=_shared_flash)
         analyses.append(a)
         print(f'  ✅ {coin}: {a["ticker"].get("last", "?")}, resonance={a["resonance"]}')
         if i < len(coins) - 1:
