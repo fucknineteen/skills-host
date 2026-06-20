@@ -1481,59 +1481,13 @@ def format_report(analyses, fg_val, fg_label):
     lines.extend(_format_summary_section(analyses))
     return '\\n'.join(lines[:split_idx]), '\\n'.join(lines[split_idx:])
 
-def _filter_calendar_events(events, window_dates, now, min_stars, max_results=5):
-    """从日历事件中提取 >= min_stars 的关键事件并格式化。"""
-    today = now.strftime('%Y-%m-%d')
-    result = []
-    for e in events:
-        pub = e.get('pub_time', '')
-        if e.get('star', 0) < min_stars:
-            continue
-        pub_date = pub.split(' ')[0] if ' ' in pub else pub[:10]
-        if pub_date not in window_dates:
-            continue
-        title = e.get('title', '')
-        title_short = title.replace('美国', '')
-        title_short = title_short.replace('年率', '')
-        title_short = title_short.replace('月', '/').replace('日', '')
-        if len(title_short) > 16:
-            title_short = title_short[:15] + '…'
-        time_str = pub.split(' ')[-1][:5] if ' ' in pub else pub[-8:-3]
-        if pub_date == today:
-            prefix = '今'
-        else:
-            days_diff = (datetime.strptime(pub_date, '%Y-%m-%d').date() - now.date()).days
-            prefix = '明' if days_diff == 1 else f'{days_diff}d后'
-        stars = e.get('star', 0)
-        result.append(f'{prefix}{time_str} {title_short}({stars}★)' if title_short.strip() else f'{prefix}{time_str} {title}({stars}★)')
-        if len(result) >= max_results:
-            break
-    return result
-
-
 def get_jin10_key_events():
-    """读取金十日历缓存，返回今日+未来2天 4★+ 关键事件摘要（如无4★则降级到3★）。"""
-    cache_path = os.path.expanduser('~/.hermes/trade_review/data/jin10_calendar_cache.json')
-    if not os.path.exists(cache_path):
-        return []
-    try:
-        import json
-        from datetime import datetime
-        with open(cache_path) as f:
-            data = json.load(f)
-        events = data.get('events', [])
-        if not events:
-            return []
-        now = datetime.now(BJT)  # BJ timezone-aware (not naive)
-        window_dates = set()
-        for d in range(3):
-            window_dates.add((now + timedelta(days=d)).strftime('%Y-%m-%d'))
-        key = _filter_calendar_events(events, window_dates, now, 4)
-        if not key:
-            key = _filter_calendar_events(events, window_dates, now, 3)
-        return key
-    except Exception:
-        return []
+    """从金十 MCP 实时获取日历 → 缓存 → 硬编码回退。返回今日+未来2天 4★+ 关键事件。"""
+    from jin10_fallback import get_calendar_events
+    events, source, fresh = get_calendar_events(min_stars=4)
+    if not events:
+        events, source, _ = get_calendar_events(min_stars=3)
+    return events
 
 
 # =========================== 社交动态文案生成 ==========================
