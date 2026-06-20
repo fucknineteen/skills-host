@@ -32,7 +32,6 @@ NOW_BJ = _NOW_UTC.astimezone(BJT)
 
 # ── 常量 ──────────────────────────────────────────────────
 MONITOR_SCRIPT = os.path.join(_TRADE_DIR, 'monitor_and_sync.py')
-ANALYSIS_SCRIPT = os.path.join(_TRADE_DIR, 'analysis_template.py')
 REVIEW_SCRIPT = os.path.join(_TRADE_DIR, 'scripts', 'review_last_post.py')
 VERIFY_SCRIPT = os.path.join(_TRADE_DIR, 'verify_social_post.py')
 SAVE_SCRIPT = os.path.join(_TRADE_DIR, 'scripts', 'save_social_post.py')
@@ -48,19 +47,6 @@ def step_sync(coins):
     if r.returncode != 0:
         print(f'  ⚠️ 同步警告: {r.stderr[:200]}')
     print(f'  ✅ 同步完成')
-    return r.stdout.strip()
-
-
-def step_analyze(coins):
-    """Step 2: 分析币种"""
-    print(f'[2/7] 分析币种 {coins}...')
-    cmd = ['python3', ANALYSIS_SCRIPT] + coins
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=_TRADE_DIR)
-    if r.returncode != 0:
-        print(f'  ⚠️ 分析警告: {r.stderr[:200]}')
-        # 尝试从 analyses.json 读取缓存
-        pass
-    print(f'  ✅ 分析完成')
     return r.stdout.strip()
 
 
@@ -207,65 +193,29 @@ def main():
     # Step 1: 同步
     step_sync(coins)
 
-    # Step 2: 分析 + 宏观并行拉取
-    analyses_raw = [None]
-    fg_val, fg_label = None, None
-    regime_result = None
-    
-    def _run_analysis():
-        analyses_raw[0] = step_analyze(coins)
-    
-    t = threading.Thread(target=_run_analysis)
-    t.start()
-    
-    # 并行：拉取 FG 和 regime（不阻塞分析）
+    # Step 2: 拉取宏观 + 执行分析（内置，无子进程冗余）
+    print(f'\n[2/7] 拉取宏观数据 + 分析币种...')
     fg_val, fg_label = fetch_fear_greed()
     regime_result = get_regime_result()
+    print(f'  ✅ FG={fg_val}({fg_label}), regime={regime_result.get("regime","?")}')
     
-    t.join()
-    print(f'  ✅ 分析+宏观并行完成')
-
-    # 从 social_analyses.json 读取分析结果（full_obj 格式）
-    analyses_file = os.path.join(_TRADE_DIR, 'social_analyses.json')
+    conn = __import__('sqlite3').connect(DB_PATH)
     analyses = []
-    if os.path.exists(analyses_file):
-        with open(analyses_file) as f:
-            analyses = json.load(f)
-
-    # 验证 analyses.json 中目标币种是否都有完整对象格式（含 indicators/levels_4h）
-    # 如果是扁平摘要格式（无 indicators/levels_4h），则 fallback 重新分析
-    need_fallback = False
-    if analyses:
-        coin_keys = {f"{c}USDT" for c in coins}
-        for record in analyses:
-            coin = record.get('coin', '')
-            if coin in coin_keys and ('indicators' not in record or 'levels_4h' not in record):
-                need_fallback = True
-                break
-
-    has_saved_analyses = False  # flag for whether we generated fresh analyses in fallback
-
-    if not analyses or need_fallback:
-        conn = __import__('sqlite3').connect(DB_PATH)
-        analyses = []
-        for i, coin in enumerate(coins):
-            # 并行拉取 ticker + funding
-            tres = [None]; fres = [None]
-            def _ft(): tres[0] = fetch_okx_ticker(f'{coin}USDT')
-            def _ff(): fres[0] = fetch_okx_funding(f'{coin}USDT')
-            t1 = threading.Thread(target=_ft)
-            t2 = threading.Thread(target=_ff)
-            t1.start(); t2.start()
-            t1.join(); t2.join()
-            a = analyze_single_coin(conn, coin, tres[0], fres[0], fg_val, fg_label)
-            analyses.append(a)
-            print(f'  ✅ {coin}: {a["ticker"].get("last", "?")}, resonance={a["resonance"]}')
-            if i < len(coins) - 1:
-                time.sleep(1)  # Rate limit protection
-        conn.close()
-        
-        has_saved_analyses = True
-    # (else: cache hit — FG and regime already fetched in parallel)
+    for i, coin in enumerate(coins):
+        tres = [None]; fres = [None]
+        def _ft(): tres[0] = fetch_okx_ticker(f'{coin}USDT')
+        def _ff(): fres[0] = fetch_okx_funding(f'{coin}USDT')
+        t1 = threading.Thread(target=_ft)
+        t2 = threading.Thread(target=_ff)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        a = analyze_single_coin(conn, coin, tres[0], fres[0], fg_val, fg_label)
+        analyses.append(a)
+        print(f'  ✅ {coin}: {a["ticker"].get("last", "?")}, resonance={a["resonance"]}')
+        if i < len(coins) - 1:
+            time.sleep(1)
+    conn.close()
+    has_saved_analyses = True
 
     # Step 3: 复盘
     review_text = step_review()
