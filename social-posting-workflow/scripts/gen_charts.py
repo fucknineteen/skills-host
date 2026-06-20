@@ -389,9 +389,11 @@ def style_card(out_path):
     
     ax.text(1, 2.4, f'ETH/BTC: {eth_p/btc_p:.4f}  |  RSI 1D: {eth_rsi_1d}', fontsize=9, color='#ffaa00', fontfamily='monospace')
     
-    # Footer badges — read from analyses.json for real-time macro data
+    # Footer badges — 优先读 social_analyses.json（full_obj），fallback analyses.json（flat_old）
     macro = {}
-    analyses_file = '/root/.hermes/trade_review/analyses.json'
+    analyses_file = '/root/.hermes/trade_review/social_analyses.json'
+    if not os.path.exists(analyses_file):
+        analyses_file = '/root/.hermes/trade_review/analyses.json'
     if os.path.exists(analyses_file):
         try:
             with open(analyses_file) as af:
