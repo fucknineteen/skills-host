@@ -4,7 +4,7 @@
 从 analysis_template.py 中提取，保持独立可导入。
 """
 import os, sys, json, subprocess, time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 
 # ── 共享常量 ──────────────────────────────────────────────
 _TRADE_DIR = os.environ.get('TRADE_DIR', '/root/.hermes/trade_review')
@@ -127,192 +127,12 @@ def get_regime_result():
         pass
     return {'regime': '未知', 'confidence': 0, 'composite_score': 0}
 
-# ── 基础工具 ──────────────────────────────────────────────
-def is_closed(ts, tf):
-    """检查指定时间戳的 K 线是否已收盘"""
-    tf_secs = {'1D': 86400, '4H': 14400, '1H': 3600, '30m': 1800, '5m': 300}
-    sec = tf_secs.get(tf, 3600)
-    return (ts + sec) <= datetime.now(timezone.utc).timestamp()
-
-def _fmt_price(v):
-    if v is None: return '-'
-    if abs(v) >= 1000: return f'{v:,.0f}'
-    return f'{v:.2f}'
-
-# ── 指标计算 ──────────────────────────────────────────────
-def calc_rsi(closes, period=14):
-    """RSI(period) — 相对强弱指数 (Wilder 平滑), 返回最后一个值"""
-    if len(closes) < period + 1:
-        return 50.0
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [max(d, 0) for d in deltas]
-    losses = [max(-d, 0) for d in deltas]
-    avg_g = sum(gains[:period]) / period
-    avg_l = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_g = (avg_g * (period - 1) + gains[i]) / period
-        avg_l = (avg_l * (period - 1) + losses[i]) / period
-    rs = avg_g / avg_l if avg_l > 0 else float('inf')
-    return 100 - 100 / (1 + rs) if rs != float('inf') else 100.0
-
-def calc_macd(closes, fast=12, slow=75, signal=9):
-    """MACD — 返回 (macd_line_val, signal_val, histogram_val) 三个标量"""
-    def _ema(data, period):
-        if len(data) < period:
-            return data[-1:] if data else [0]
-        a = 2 / (period + 1)
-        e = [data[0]]
-        for i in range(1, len(data)):
-            e.append(a * data[i] + (1 - a) * e[-1])
-        return e
-    if len(closes) < slow + signal:
-        return 0.0, 0.0, 0.0
-    e_fast = _ema(closes, fast)
-    e_slow = _ema(closes, slow)
-    macd_vals = [e_fast[i] - e_slow[i] for i in range(len(closes))]
-    sig_vals = _ema(macd_vals, signal)
-    return macd_vals[-1], sig_vals[-1], macd_vals[-1] - sig_vals[-1]
-
-def calc_adx(highs, lows, closes, period=14):
-    if len(highs) < period + 1: return 0, 0, 0, 0
-    tr = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])) for i in range(1, len(highs))]
-    dm_up = [max(highs[i] - highs[i-1], 0) for i in range(1, len(highs))]
-    dm_down = [max(lows[i-1] - lows[i], 0) for i in range(1, len(highs))]
-    atr = sum(tr[:period]) / period
-    di_plus = sum(dm_up[:period])
-    di_minus = sum(dm_down[:period])
-    for i in range(period, len(tr)):
-        atr = (atr * (period - 1) + tr[i]) / period
-        di_plus = di_plus * (period - 1) + dm_up[i]
-        di_minus = di_minus * (period - 1) + dm_down[i]
-    dx = (abs(di_plus - di_minus) / (di_plus + di_minus)) * 100 if (di_plus + di_minus) > 0 else 0
-    atr_last = atr
-    return round(dx, 1), round(di_plus, 1), round(di_minus, 1), round(atr_last, 2)
-
-def calc_bollinger(closes, period=20, mult=2):
-    if len(closes) < period: return None
-    window = closes[-period:]
-    mean = sum(window) / period
-    std = (sum((x - mean) ** 2 for x in window) / period) ** 0.5
-    upper = mean + mult * std
-    lower = mean - mult * std
-    latest = closes[-1]
-    pct_b = (latest - lower) / (upper - lower) if (upper - lower) > 0 else 0.5
-    return {'upper': round(upper, 2), 'middle': round(mean, 2), 'lower': round(lower, 2), 'pct_b': round(pct_b * 100, 1)}
-
-def calc_obv(rows):
-    if len(rows) < 2: return 0
-    obv = 0
-    for i in range(1, len(rows)):
-        if rows[i][4] > rows[i-1][4]: obv += rows[i][5]
-        elif rows[i][4] < rows[i-1][4]: obv -= rows[i][5]
-    return round(obv, 0)
-
-# ── K 线分析 ──────────────────────────────────────────────
-def candle_body_label(row):
-    if not row: return '-'
-    o, h, l, c, v = row[1], row[2], row[3], row[4], row[5]
-    body = abs(c - o)
-    range_hl = h - l
-    if range_hl == 0: return '十字星'
-    body_pct = body / range_hl * 100
-    if body_pct > 70:
-        if c > o: return '大阳+'
-        else: return '大阴-'
-    elif body_pct > 40:
-        if c > o: return '中阳'
-        else: return '中阴'
-    elif body_pct < 10:
-        return '十字星'
-    elif c > o:
-        return '小阳'
-    else:
-        return '小阴'
-
-def trend_direction(rows):
-    if len(rows) < 5: return '数据不足'
-    closes = [r[4] for r in rows[-10:]]
-    if len(closes) < 5: return '数据不足'
-    up = sum(1 for i in range(1, len(closes)) if closes[i] > closes[i-1])
-    down = len(closes) - up
-    if up >= down * 1.5: return '偏多'
-    elif down >= up * 1.5: return '偏空'
-    return '盘整'
-
-def check_acceleration(days, tf='1D'):
-    """检查加速下跌/减速"""
-    if not days or len(days) < 3: return 'insufficient_data'
-    closes = [r[4] for r in days]
-    if len(closes) < 3: return 'insufficient_data'
-    changes = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
-    last_change = changes[-1]
-    avg_recent = sum(changes[-3:]) / min(3, len(changes))
-    if last_change < -0.03 and avg_recent < -0.02:
-        return 'accelerating_bear'
-    elif last_change > -0.01 and avg_recent < -0.02:
-        return 'decelerating'
-    return 'steady'
-
-def check_extreme_oversold(rsi_1d, fg_val):
-    if rsi_1d is not None and rsi_1d < 20 and fg_val is not None and fg_val < 15:
-        return True, '[X1] RSI<20+FG<15 → V反概率极高，空头信号降级为观望'
-    return False, None
-
-def check_data_event_window():
-    """重大数据事件前48h+后12h → 方向置信度最低"""
-    events = [
-        ("FOMC", datetime(2026, 6, 18, 2, 0, tzinfo=BJT), "利率决议"),
-        ("CPI", datetime(2026, 7, 15, 20, 30, tzinfo=BJT), "通胀数据"),
-    ]
-    now = datetime.now(BJT)
-    for name, evt_dt, etype in events:
-        hours = (evt_dt - now).total_seconds() / 3600
-        if -12 <= hours <= 48:
-            return True, f'[X3] {name} {evt_dt.strftime("%m/%d %H:%M")} BJ — 距公布{hours:.0f}h，方向置信度最低'
-        elif -24 <= hours <= 0:
-            return True, f'[X3] {name} {evt_dt.strftime("%m/%d %H:%M")} BJ — 数据后{abs(hours):.0f}h，TA仍在消化'
-    return False, None
-
-# ── 数据库查询 ────────────────────────────────────────────
-def get_rows(conn, coin, tf, limit=100):
-    """获取已收盘和未收盘的K线"""
-    closed = conn.execute(
-        f"SELECT ts, open, high, low, close, volume FROM klines "
-        f"WHERE coin=? AND timeframe=? ORDER BY ts DESC LIMIT ?",
-        (coin, tf, limit)
-    ).fetchall()
-    closed.reverse()
-    unclosed = []
-    return closed, unclosed
-
-def get_db_coins():
-    conn = sqlite3.connect(_DB)
-    coins = set()
-    for row in conn.execute("SELECT DISTINCT coin FROM klines"):
-        coins.add(row[0])
-    conn.close()
-    return coins
-
-# ── 数据新鲜度 ────────────────────────────────────────────
-def build_data_freshness(conn, coin):
-    """检查各周期数据新鲜度"""
-    freshness = {}
-    for tf in ['1D', '4H', '1H']:
-        row = conn.execute(
-            "SELECT ts FROM klines WHERE coin=? AND timeframe=? ORDER BY ts DESC LIMIT 1",
-            (coin, tf)
-        ).fetchone()
-        if row:
-            age_min = (datetime.now(timezone.utc).timestamp() * 1000 - row[0]) / 60000
-            freshness[tf] = f'{age_min:.0f}min ago'
-        else:
-            freshness[tf] = 'no_data'
-    return freshness
-
-# ── 单币种完整分析 ─────────────────────────────────────────
+# ── 单币种完整分析 (wrapper) ─────────────────────────────────
 def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
-    """对单个币种执行完整分析"""
-    TIMEFRAMES = ['1D', '4H', '1H', '30m', '5m']
+    """对单个币种执行完整分析。
+    底层统一调用 analysis_template.analyze_single_coin，
+    在此基础上补充 position / vp / wyckoff / calendar / macro 五个社交专用字段。
+    """
     
     # Fallback: 如果 API 返回错误，从 DB 读最新收盘价
     if isinstance(ticker, dict) and ticker.get('_error'):
@@ -325,197 +145,51 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
         else:
             ticker = {'last': '?', '_fallback': True}
     
-    # 收盘状态
-    close_status = {}
-    for tf in TIMEFRAMES:
-        closed, unclosed = get_rows(conn, coin, tf)
-        close_status[tf] = {'closed': closed, 'n_closed': len(closed)}
-
-    # 指标计算
-    indicators = {}
-    for tf in TIMEFRAMES:
-        closed = close_status[tf]['closed']
-        if len(closed) < 15:
-            indicators[tf] = {'_skip': f'{len(closed)} candles, need 15+'}
-            continue
-        closes = [r[4] for r in closed]
-        highs = [r[2] for r in closed]
-        lows = [r[3] for r in closed]
-        rsi = calc_rsi(closes, 14)
-        mf, ms, msig = MACD_PARAMS.get(coin, (12, 75, 9))
-        macd_l, macd_s, macd_h = calc_macd(closes, mf, ms, msig)
-        adx, di_p, di_m, atr = calc_adx(highs, lows, closes, 14)
-        bb = calc_bollinger(closes, 20, 2)
-        obv = calc_obv(closed)
-        trend_dir = trend_direction(closed)
-        if trend_dir == '盘整' and macd_h is not None and macd_h > 0:
-            if len(closes) >= 5 and closes[-1] >= max(closes[-5:]) * 0.98:
-                trend_dir = '偏多'
-        latest_label = candle_body_label(closed[-1]) if closed else '-'
-        indicators[tf] = {
-            'rsi': rsi, 'macd_l': macd_l, 'macd_s': macd_s, 'macd_h': macd_h,
-            'adx': adx, 'di_p': di_p, 'di_m': di_m, 'atr': atr,
-            'bb': bb, 'obv': obv, 'trend': trend_dir, 'label': latest_label,
-            'last_close': closes[-1] if closes else None,
-        }
-
-    # 加速下跌
-    closed_1d = close_status['1D']['closed']
-    accel = check_acceleration(closed_1d) if len(closed_1d) >= 3 else 'insufficient_data'
-
-    # 支撑阻力
-    def get_levels(tf, n=20):
-        cl = close_status.get(tf, {}).get('closed', [])
-        if len(cl) < n:
-            cl = close_status['1D']['closed']
-        recent = cl[-n:]
-        return {
-            'highs': sorted(set(round(r[2], 1) for r in recent), reverse=True),
-            'lows': sorted(set(round(r[3], 1) for r in recent))
-        }
-    levels_4h = get_levels('4H')
-
-    # 底部研判
-    rsi_1d = indicators['1D'].get('rsi')
-    near_bottom = False
-    bottom_note = '-'
-    if rsi_1d is not None:
-        if rsi_1d < 33 and fg_val is not None and fg_val < 25:
-            if accel == 'accelerating_bear':
-                bottom_note = '加速下跌 → near_bottom 禁用'
-            elif accel == 'decelerating':
-                bottom_note = '减速 → near_bottom 可讨论但未确认'
-            else:
-                bottom_note = 'near_bottom (RSI<33 + FG<25) — 观望，等放量阳线'
-                near_bottom = True
-        elif rsi_1d < 33:
-            bottom_note = 'RSI<33 但 FG 未知 → level 未定'
-
-    # 共振判断
-    rsi_4h = indicators['4H'].get('rsi')
-    rsi_1h = indicators['1H'].get('rsi')
-    macd_h_1h = indicators['1H'].get('macd_h')
-    macd_h_4h = indicators['4H'].get('macd_h')
-    bb_1h = indicators['1H'].get('bb')
-    pct_b = bb_1h['pct_b'] if bb_1h else 50
-    score = 0
-    if rsi_4h is not None:
-        if rsi_4h > 55: score += 1
-        elif rsi_4h < 45: score -= 1
-    if macd_h_4h is not None:
-        if macd_h_4h > 0: score += 1
-        elif macd_h_4h < 0: score -= 1
-    if pct_b < 30: score -= 1
-    elif pct_b > 70: score += 1
-    if score >= 2: resonance = '🟢偏强'
-    elif score <= -2: resonance = '🔴偏弱'
-    else: resonance = '🟡分歧'
-
-    # 风险
-    risks = []
-    lessons_warnings = []
-    rsi_1d_val = indicators['1D'].get('rsi')
-    is_x1, x1_msg = check_extreme_oversold(rsi_1d_val, fg_val)
-    if is_x1:
-        lessons_warnings.append(x1_msg)
-        if near_bottom:
-            near_bottom = False
-            bottom_note = f'{x1_msg} — near_bottom被复盘教训覆盖，强制观望'
-    is_x3, x3_msg = check_data_event_window()
-    if is_x3:
-        lessons_warnings.append(x3_msg)
-        risks.append(x3_msg)
-
-    # K线收盘状态
-    _now = datetime.now(BJT)
-    _now_ts = _now.timestamp()
-    _tf_close = {'1D': 86400, '4H': 14400, '1H': 3600, '30m': 1800, '5m': 300}
-    data_selection_lines = [f'📐 K线收盘状态 [{_now.strftime("%m-%d %H:%M")} BJ]:']
-    for _tf, _sec in _tf_close.items():
-        _rows = conn.execute(
-            f'SELECT ts FROM klines WHERE coin=? AND timeframe=? ORDER BY ts DESC LIMIT 2',
-            (coin, _tf)
-        ).fetchall()
-        if not _rows:
-            data_selection_lines.append(f'  {_tf}: 无数据')
-            continue
-        _ts = _rows[0][0] / 1000
-        _end = _ts + _sec
-        _end_bj = datetime.fromtimestamp(_end, tz=BJT)
-        if _end <= _now_ts:
-            _t_bj = datetime.fromtimestamp(_ts, tz=BJT)
-            data_selection_lines.append(f'  {_tf}: {_t_bj.strftime("%m-%d %H:%M")} ✅')
-        else:
-            _t_bj = datetime.fromtimestamp(_ts, tz=BJT)
-            if len(_rows) > 1:
-                _prev_ts = _rows[1][0] / 1000
-                _prev_bj = datetime.fromtimestamp(_prev_ts, tz=BJT)
-                data_selection_lines.append(f'  {_tf}: {_prev_bj.strftime("%m-%d %H:%M")} ✅ | 今{_t_bj.strftime("%m-%d %H:%M")}形成中(→{_end_bj.strftime("%m-%d %H:%M")})')
-            else:
-                data_selection_lines.append(f'  {_tf}: 今{_t_bj.strftime("%m-%d %H:%M")}形成中(→{_end_bj.strftime("%m-%d %H:%M")})')
-
-    data_freshness = build_data_freshness(conn, coin)
-
+    # 调用 analysis_template 的基础分析（统一底层实现）
+    result = _base_analyze(conn, coin, ticker, funding, fg_val, fg_label)
+    
+    # ── 补全社交专用字段 ──
+    resonance = result['resonance']
+    rsi_1d_val = result['indicators']['1D'].get('rsi')
+    trend_1d = result['indicators']['1D'].get('trend', '')
+    macd_h_4h = result.get('macd_h_4h')
+    near_bottom = result.get('near_bottom', False)
+    
     # 方向判定 — 共振 + near_top + V反保护
-    trend_1d = indicators['1D'].get('trend', '')
-    rsi_1d_val = indicators['1D'].get('rsi')
     position_raw = '偏多' if '强' in str(resonance) else ('偏空' if '弱' in str(resonance) else '观望')
-    # L1: near_top 做空捷径
+    # L1: near_top 做空捷径（trend_1d 为 analysis_template 格式：上升/下降/盘整）
     if position_raw == '观望' and rsi_1d_val and rsi_1d_val > 67 and trend_1d == '下降' and macd_h_4h is not None and macd_h_4h < 0:
         position_raw = '偏空'
     # L3: V反保护
     if position_raw == '偏空' and near_bottom:
         position_raw = '观望（near_bottom保护）'
+    result['position'] = position_raw
     
-    # ── 补全：威科夫 / Volume Profile / K线形态 / 日历 ──
+    # 威科夫 / Volume Profile / 日历 / 宏观
     result_dict = {
-        'coin': coin, 'close_status': close_status,
-        'levels_4h': levels_4h, 'indicators': indicators,
-        'accel': accel, 'near_bottom': near_bottom,
-        'resonance': resonance, 'risks': risks,
+        'coin': coin, 'close_status': result['close_status'],
+        'levels_4h': result['levels_4h'], 'indicators': result['indicators'],
+        'accel': result['accel'], 'near_bottom': near_bottom,
+        'resonance': resonance, 'risks': result.get('risks', []),
     }
-    vp_data = session_vp(coin, conn) or {}
-    wyckoff_data = wyckoff_detect(result_dict) or {}
-    kline_patterns = detect_kline_patterns(result_dict)
-    calendar_events = get_jin10_key_events()
-    # 提取 macro 数据（从 regime_cache，含 DXY/VIX/10Y/BTC.D）
+    result['vp_data'] = session_vp(coin, conn) or {}
+    result['wyckoff_data'] = wyckoff_detect(result_dict) or {}
+    # kline_patterns 已在 _base_analyze 中计算，不覆盖
+    result['calendar_events'] = get_jin10_key_events()
+    
+    # macro 数据（从 regime_cache，含 DXY/VIX/10Y/BTC.D）
     macro_external = {}
     try:
-        import json as _json
         if os.path.exists(_REGIME_CACHE):
             with open(_REGIME_CACHE) as _f:
-                _rc = _json.load(_f)
+                _rc = json.load(_f)
             me = _rc.get('macro_external', {})
             macro_external = me if isinstance(me, dict) else {}
     except Exception:
         pass
+    result['macro_external'] = macro_external
     
-    return {
-        'coin': coin,
-        'ticker': ticker,
-        'funding': funding,
-        'close_status': close_status,
-        'data_freshness': data_freshness,
-        'data_selection': '\n'.join(data_selection_lines),
-        'indicators': indicators,
-        'accel': accel,
-        'levels_4h': levels_4h,
-        'bottom_note': bottom_note,
-        'near_bottom': near_bottom,
-        'resonance': resonance,
-        'position': position_raw,
-        'risks': risks,
-        'rsi_4h': rsi_4h, 'rsi_1h': rsi_1h,
-        'macd_h_4h': macd_h_4h, 'macd_h_1h': macd_h_1h,
-        'pct_b': pct_b,
-        'lessons_warnings': lessons_warnings,
-        # 威科夫 / VP / 形态 / 日历（与 analysis_template.py 同步）
-        'vp_data': vp_data,
-        'wyckoff_data': wyckoff_data,
-        'kline_patterns': kline_patterns,
-        'calendar_events': calendar_events,
-        'macro_external': macro_external,
-    }
+    return result
 
 # ── 方向提取 ──────────────────────────────────────────────
 def extract_direction(coin_a):
