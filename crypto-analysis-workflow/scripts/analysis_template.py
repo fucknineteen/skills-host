@@ -919,26 +919,14 @@ def cvd_proxy(ticker, extra=None):
         return {'direction': 'neutral', 'strength': 0, 'detail': '计算异常'}
 
 def session_vp(coin, conn):
-    """当前时段 Volume Profile — POC/VAH/VAL 从 15m K线计算。"""
-    from datetime import timedelta
+    """全天 Volume Profile（24h）— POC/VAH/VAL 从 15m K线计算。"""
     now_bj = datetime.now(BJT)
-    today_00 = now_bj.replace(hour=0, minute=0, second=0, microsecond=0)
-    h = now_bj.hour
-    if 8 <= h < 16:
-        session_start = today_00.replace(hour=8)
-        session_name = 'Asia'
-    elif 16 <= h < 24:
-        session_start = today_00.replace(hour=16)
-        session_name = 'Europe'
-    else:
-        session_start = today_00
-        session_name = 'US'
-    start_ts = int(session_start.timestamp() * 1000)
-    end_ts = int((session_start + timedelta(hours=8)).timestamp() * 1000)
+    end_ts = int(now_bj.timestamp() * 1000)
+    start_ts = int((now_bj - timedelta(hours=24)).timestamp() * 1000)
     try:
         rows = conn.execute('''
             SELECT high, low, volume FROM klines
-            WHERE coin=? AND timeframe='15m' AND ts >= ? AND ts < ?
+            WHERE coin=? AND timeframe='15m' AND ts >= ? AND ts <= ?
             ORDER BY ts ASC
         ''', (coin, start_ts, end_ts)).fetchall()
         if len(rows) < 8:
@@ -985,7 +973,7 @@ def session_vp(coin, conn):
             else:
                 break
         return {
-            'session': session_name,
+            'hours': 24,
             'poc': poc_val,
             'vah': sorted_bins[right][0],
             'val': sorted_bins[left][0],
