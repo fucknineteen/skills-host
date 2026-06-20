@@ -246,6 +246,7 @@ for r in data[-10:]:
 
 - **ETH 缺少 1h/4h/1d 数据**（仅 5m/15m/30m 可用）→ 详见 [`references/eth-data-gap.md`](references/eth-data-gap.md)。分析时需在结论中注明数据局限性。
 - **快讯集成架构**：详见 [`references/flash-news-integration.md`](references/flash-news-integration.md)。
+- **技能维护陷阱**：详见 [`references/skill-maintenance-pitfalls.md`](references/skill-maintenance-pitfalls.md)。
 
 ## 六、仓位方向逻辑（`position` 字段）
 
