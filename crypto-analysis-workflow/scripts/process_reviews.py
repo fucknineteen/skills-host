@@ -34,10 +34,9 @@ def get_current_regime():
     return None
 
 def save_lessons_regime_aware(lessons):
-    """Save lessons to both lessons.json and regime-specific file."""
-    # Save to main lessons.json
-    with open(LESSONS_PATH, 'w') as f:
-        json.dump(lessons, f, indent=2, ensure_ascii=False)
+    """Save lessons to both lessons.json and regime-specific file.
+    lessons.json = 所有行情类型的教训并集（累积，每次重建）
+    regimes/{regime}_lessons.json = 单行情类型教训（追加，去重）"""
     
     # Ensure all known regime lesson files exist (empty array if missing)
     try:
@@ -52,7 +51,7 @@ def save_lessons_regime_aware(lessons):
     except Exception:
         pass
     
-    # Detect regime and save to regime file
+    # Detect regime and save to regime file (累积追加)
     regime = get_current_regime()
     if regime:
         regime_path = f'{REGIME_DIR}/{regime}_lessons.json'
@@ -82,6 +81,22 @@ def save_lessons_regime_aware(lessons):
         
         if new_count > 0:
             print(f"   → 同步到行情类型文件: {regime}_lessons.json (+{new_count}条)")
+    
+    # Rebuild lessons.json from all regime files (并集，每次重建)
+    all_lessons = []
+    if os.path.isdir(REGIME_DIR):
+        for fname in os.listdir(REGIME_DIR):
+            if fname.endswith('_lessons.json'):
+                try:
+                    with open(os.path.join(REGIME_DIR, fname), 'r') as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            all_lessons.extend(data)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    pass
+    
+    with open(LESSONS_PATH, 'w') as f:
+        json.dump(all_lessons, f, indent=2, ensure_ascii=False)
 
 # Direction keywords — priority order matters for mixed signals
 # Bullish indicators (higher priority when combined with bearish)
@@ -481,39 +496,77 @@ def do_12h_review(review, analysis, now_utc, db):
 
 def extract_lessons(dir_score, wyckoff_score, levels_score, pct_change,
                    analysis, coin, date_str):
-    """Extract and categorize lessons."""
+    """Extract and categorize lessons.
+    
+    教训生成规则：
+    - 总分≥2（+2或+3）：分析基本正确，不产生教训
+    - 总分≤1：对每个评分≤0的维度生成教训
+        - 评分=-1：明确错误 → 用"误判"语言
+        - 评分=0：未确认/中性 → 用"未确认"语言
+    """
     lessons = []
     if analysis is None:
         return lessons
     
+    total = dir_score + wyckoff_score + levels_score
+    if total >= 2:
+        return lessons  # 分析基本正确，无需教训
+    
     # direction_misjudge — use actual price change, not text keywords
-    if dir_score == -1:
-        # Check for extreme oversold condition from K-line data
-        # Support both flat_old (rsi_14) and full_obj (rsi_4h)
+    if dir_score <= 0:
         rsi = analysis.get('rsi_14', 0) or analysis.get('rsi_4h', 0)
         fg = analysis.get('macro', {}).get('fear_greed', 0) if 'macro' in analysis else 0
         
-        if rsi and rsi < 20 and fg and fg < 20:
+        if dir_score == -1:
+            if rsi and rsi < 20 and fg and fg < 20:
+                lessons.append({
+                    'category': 'direction_misjudge',
+                    'type': '方向误判',
+                    'lesson': f"{coin}: 极端超卖(RSI={rsi},FG={fg})环境做空是系统性错误。实际涨{pct_change:+.1f}%。RSI<20+FG<20应自动降级为中性/观望。"
+                })
+            else:
+                actual_label = '涨' if pct_change > 0 else '跌'
+                lessons.append({
+                    'category': 'direction_misjudge',
+                    'type': '方向误判',
+                    'lesson': f"{coin}: 方向误判。实际{actual_label}{pct_change:+.1f}%。"
+                })
+        else:  # dir_score == 0
             lessons.append({
-                'category': 'direction_misjudge',
-                'type': '方向误判',
-                'lesson': f"{coin}: 极端超卖(RSI={rsi},FG={fg})环境做空是系统性错误。实际涨{pct_change:+.1f}%。RSI<20+FG<20应自动降级为中性/观望。"
-            })
-        else:
-            actual_label = '涨' if pct_change > 0 else '跌'
-            lessons.append({
-                'category': 'direction_misjudge',
-                'type': '方向误判',
-                'lesson': f"{coin}: 方向误判。实际{actual_label}{pct_change:+.1f}%。"
+                'category': 'direction_uncertain',
+                'type': '方向未确认',
+                'lesson': f"{coin}: 方向信号未在12h窗口内确认（波动{pct_change:+.1f}%）。入场时机或方向需重新评估。"
             })
     
     # signal_misread
-    if wyckoff_score == -1:
-        lessons.append({
-            'category': 'signal_misread',
-            'type': '信号误判',
-            'lesson': f"{coin}: 信号未被确认，价格续跌{pct_change:+.1f}%。极端超卖环境下的Spring需额外确认（放量阳线+二次回踩）。"
-        })
+    if wyckoff_score <= 0:
+        if wyckoff_score == -1:
+            lessons.append({
+                'category': 'signal_misread',
+                'type': '信号误判',
+                'lesson': f"{coin}: 信号未被确认，价格续跌{pct_change:+.1f}%。极端超卖环境下的Spring需额外确认（放量阳线+二次回踩）。"
+            })
+        else:  # wyckoff_score == 0
+            lessons.append({
+                'category': 'signal_unconfirmed',
+                'type': '信号未确认',
+                'lesson': f"{coin}: 威科夫/形态信号在12h窗口内未得到价格确认。该信号在当前环境下效力不足，需更多K线验证。"
+            })
+    
+    # levels_miss
+    if levels_score <= 0:
+        if levels_score == -1:
+            lessons.append({
+                'category': 'levels_miss',
+                'type': '价位误判',
+                'lesson': f"{coin}: 支撑/阻力位全部失效，价格突破关键价位{pct_change:+.1f}%。价位设定需参考更高级别结构。"
+            })
+        else:  # levels_score == 0
+            lessons.append({
+                'category': 'levels_unused',
+                'type': '价位未触及',
+                'lesson': f"{coin}: 12h窗口内未触及任何设定价位。支撑/阻力带可能过宽，需用ATR动态调整宽度。"
+            })
     
     # acceleration_miss — use actual K-line drop, not text search
     # near_bottom: check if sentiment field has it (objective), or use K-line drop

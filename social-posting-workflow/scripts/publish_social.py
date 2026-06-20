@@ -299,16 +299,21 @@ def main():
                 highs = a.get('levels_4h', {}).get('highs', [])
                 entry = float(a.get('ticker', {}).get('last', 0) or 0)
                 
-                # 计算止损/止盈（与 generate_social_draft 一致）
-                if coin_tag == 'BTC':
-                    sl_mult = 0.99
-                    tp_mult = 1.0
-                else:  # ETH
-                    sl_mult = 0.985
-                    tp_mult = 1.0
+                # 计算止损/止盈 — P1b: ATR缓冲 + 区分多空
+                inds = a.get('indicators', {})
+                atr_4h_val = inds.get('4H', {}).get('atr', entry * 0.02)
+                pos_dir = a.get('position', '观望')
                 
-                sl_val = int(lows[0] * sl_mult) if lows and entry else 0
-                tp_val = int(highs[0] * tp_mult) if highs else 0
+                if lows and highs and entry and atr_4h_val:
+                    if '空' in str(pos_dir):
+                        sl_val = int(highs[0] + atr_4h_val * 0.5)
+                        tp_val = int(lows[0])
+                    else:
+                        sl_val = int(lows[0] - atr_4h_val * 0.5)
+                        tp_val = int(highs[0])
+                else:
+                    sl_val = 0
+                    tp_val = 0
                 
                 # 计算 RR
                 rr_str = '?'
@@ -335,6 +340,7 @@ def main():
                     'indicators': a['indicators'],
                     'levels_4h': a['levels_4h'],
                     'resonance': a['resonance'],
+                    'position': a.get('position', '观望'),
                     'rsi_4h': a['rsi_4h'],
                     'macd_h_4h': a['macd_h_4h'],
                     'macd_h_1h': a['macd_h_1h'],

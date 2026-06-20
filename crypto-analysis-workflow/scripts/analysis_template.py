@@ -130,32 +130,41 @@ def check_data_event_window():
 # BTC合约面值0.01, ETH合约面值0.1
 CONTRACT_SIZE = {'BTC': 0.01, 'ETH': 0.1, 'SOL': 1.0, 'DOGE': 10.0}
 MAX_RISK_PCT = 2.0  # 单笔最大风险占账户百分比
+LEVERAGE = 20  # 默认杠杆倍数
+ACCOUNT_USD = 100  # 小账户本金
+# OKX 维护保证金率%（mmr）
+MARGIN_MAINTENANCE = {
+    'BTC': 0.5, 'ETH': 1.0,
+    'SOL': 2.0, 'DOGE': 2.5,
+}
 
-def calc_position(coin, entry, sl, account_usd=100, risk_pct=2.0):
+def calc_position(coin, entry, sl, account_usd=None, risk_pct=None):
     """计算建议仓位张数 + 爆仓安全距离"""
+    if account_usd is None:
+        account_usd = ACCOUNT_USD
+    if risk_pct is None:
+        risk_pct = MAX_RISK_PCT
     cs = CONTRACT_SIZE.get(coin, 1.0)
     risk_usd = account_usd * risk_pct / 100
     sl_pct = abs(entry - sl) / entry * 100  # 止损距离%
-    
+
     if sl_pct < 0.1:  # 止损太近不可靠
         return None
-    
+
     # 最大仓位(USD) = 风险金额 / 止损距离%
     max_notional = risk_usd / (sl_pct / 100)
     contracts = max_notional / (entry * cs)
-    
-    # 爆仓距离估算(20x杠杆)，按币种维护保证金率
-    # BTC 维护保证金0.5% → 爆仓距≈5%-0.5%=4.5%
-    # ETH 维护保证金1.0% → 爆仓距≈5%-1.0%=4.0%
-    mm_map = {'BTC': 0.5, 'ETH': 1.0}  # 维护保证金率%
-    mm_pct = mm_map.get(coin, 1.5)  # 山寨默认1.5%
-    liq_pct = 100 / 20 - mm_pct  # BTC=4.5%, ETH=4.0%
-    
+
+    # 爆仓距离估算：杠杆倍数 → 爆仓距 = 100/杠杆% - 维护保证金%
+    mm_pct = MARGIN_MAINTENANCE.get(coin, 1.5)
+    liq_pct = 100 / LEVERAGE - mm_pct  # BTC=4.5%, ETH=4.0%
+
     return {
         'risk_usd': risk_usd,
         'sl_pct': sl_pct,
         'max_notional': max_notional,
-        'contracts': contracts,
+        'contracts': math.floor(contracts),  # P2: OKX 要求整张
+        'contracts_raw': contracts,  # 保留原始值供参考
         'liq_safe': sl_pct < liq_pct,  # 止损在爆仓前
         'liq_pct': liq_pct,
     }
@@ -1289,28 +1298,49 @@ def _format_coin_section(a):
     rsi_1h_val = a.get('rsi_1h', 50)
     macd_4h_val = a.get('macd_h_4h', 0)
     atr_4h = ind['4H'].get('atr', 0)
-    close_1d = ind['1D'].get('last_close', cp)
-    if a['near_bottom'] and macd_4h_val > -50 and rsi_1h_val < 45:
+    trend_1d = ind['1D'].get('trend', '')
+    trend_4h = ind['4H'].get('trend', '')
+    # 仓位方向判定：共振优先 + near_bottom/near_top + MACD/RSI 为辅
+    resonance = a.get('resonance', '')
+    if '强' in str(resonance) or (a['near_bottom'] and macd_4h_val > -50 and rsi_1h_val < 45):
         pos_dir = '试多'
-    elif rsi_1d > 65 and macd_4h_val < -50:
+    elif '弱' in str(resonance) or (rsi_1d > 65 and macd_4h_val < -50):
         pos_dir = '试空'
+    elif rsi_1d > 67 and trend_1d == '下降' and macd_4h_val < 0:
+        pos_dir = '试空'  # L1: near_top 做空捷径，跳过共振门槛
     else:
         pos_dir = '观望'
+    # L3: V反保护 — 底部区域/反弹中禁止做空
+    if pos_dir == '试空':
+        if a.get('near_bottom'):
+            pos_dir = '观望（near_bottom保护）'
+        elif closed_4h and len(closed_4h) >= 8:
+            # 检测过去 8 根 4H 是否从低点反弹 > 3%（Spring/V反特征）
+            lows_8 = [r[3] for r in closed_4h[-8:]]
+            min_low = min(lows_8)
+            current = float(t.get('last', closed_4h[-1][4]))
+            recovery_pct = (current - min_low) / min_low * 100 if min_low > 0 else 0
+            if recovery_pct > 3:
+                pos_dir = '观望（反弹{:.1f}%，V反保护）'.format(recovery_pct)
     entry = sl = tp = rr = None
-    if pos_dir != '观望' and lows_near and highs_near and atr_4h:
-        entry = close_1d
-        sl = lows_near[0] - atr_4h * 0.5
-        tp = highs_near[0]
+    if pos_dir.startswith('试') and lows_near and highs_near and atr_4h:
+        entry = float(t.get('last', cp))  # P1a: 用 ticker 现价
+        if pos_dir == '试多':
+            sl = lows_near[0] - atr_4h * 0.5
+            tp = highs_near[0]
+        else:  # 试空
+            sl = highs_near[0] + atr_4h * 0.5
+            tp = lows_near[0]
         rr = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
         pos_line = f'仓位: {pos_dir} | 入场{_fmt_price(entry)} | SL{_fmt_price(sl)} | TP{_fmt_price(tp)} | 盈亏比 1:{rr:.1f}'
         if rr < 1.5:
             pos_line += ' ⚠️'
         pos = calc_position(coin, entry, sl)
         if pos and not pos['liq_safe']:
-            pos_line += ' ⛔SL>爆仓距不输出建议'
+            pos_line += f' ⛔爆仓距{pos["liq_pct"]:.1f}%<SL距{pos["sl_pct"]:.1f}%'
             pos_dir = '观望'
-    elif pos_dir == '观望':
-        pos_line = '仓位: 观望（等放量阳线确认底部）'
+    elif pos_dir.startswith('观望'):
+        pos_line = '仓位: ' + pos_dir
     else:
         pos_line = f'仓位: {pos_dir}（数据不足，无法计算精确SL/TP）'
     a['_pos_dir'] = pos_dir
@@ -1319,13 +1349,14 @@ def _format_coin_section(a):
     a['_tp'] = tp
     a['_rr'] = rr
     lines.append(pos_line)
-    if pos_dir != '观望' and '入场' in pos_line:
+    if pos_dir.startswith('试') and '入场' in pos_line:
         pos = calc_position(coin, entry, sl)
         if pos:
             slp = pos["sl_pct"]
             c_s = f'{pos["contracts"]:.1f}张' if pos['contracts'] >= 1 else f'{pos["contracts"]:.2f}张'
+            liq_price = entry * (1 - pos['liq_pct']/100) if pos_dir == '试多' else entry * (1 + pos['liq_pct']/100)
             safe = '✅' if pos['liq_safe'] else '⚠️爆仓距<止损'
-            lines.append(f'  仓位公式: SL距{slp:.1f}% | 每$100(2%风险)可开{c_s} | 爆仓安全{safe}')
+            lines.append(f'  仓位公式: SL距{slp:.1f}% | 每$100(2%风险)可开{c_s} | 爆仓价{liq_price:.1f}(距{pos["liq_pct"]:.1f}%) | 安全{safe}')
     return lines
 
 
@@ -1396,14 +1427,14 @@ def _format_summary_section(analyses):
         coin = a['coin']
         pos_dir = a.get('_pos_dir', '观望')
         entry = a.get('_entry')
-        if pos_dir != '观望' and entry is not None:
+        if pos_dir.startswith('试') and entry is not None:
             sl = a['_sl']
             tp = a['_tp']
             rr = a['_rr']
             guidance = f'{pos_dir} | 入场{_fmt_price(entry)} SL{_fmt_price(sl)} TP{_fmt_price(tp)} | 盈亏比 1:{rr:.1f}'
             if rr < 1.5:
                 guidance += ' ⚠️'
-        elif pos_dir == '观望':
+        elif pos_dir.startswith('观望'):
             guidance = '观望（等放量阳线确认）'
         else:
             guidance = f'{pos_dir}（数据不足）'
@@ -1424,20 +1455,18 @@ def _format_summary_section(analyses):
     lines.append('--- 仓位公式(小账户·每笔≤2%风险·20x杠杆) ---')
     for a in analyses:
         coin = a['coin']
-        ind = a.get('indicators', {})
-        atr = ind['4H'].get('atr', 0)
-        close_1d = ind['1D'].get('last_close', 0)
-        lows_near = a.get('near_support', [])
-        if lows_near and atr and close_1d:
-            entry = close_1d
-            sl = lows_near[0] - atr * 0.5
+        pos_dir = a.get('_pos_dir', '观望')
+        entry = a.get('_entry')
+        sl = a.get('_sl')
+        if pos_dir.startswith('试') and entry and sl:
             pos = calc_position(coin, entry, sl)
             if pos:
                 ref = '$100' if coin in ('BTC','ETH') else '$50'
                 margin_1ct = entry * CONTRACT_SIZE.get(coin, 1.0) * 20
                 c_s = f'{pos["contracts"]:.1f}张' if pos['contracts'] >= 1 else f'<1张(需${margin_1ct:.0f}保证金)'
+                liq_price = entry * (1 - pos['liq_pct']/100) if pos_dir == '试多' else entry * (1 + pos['liq_pct']/100)
                 safe = '✅' if pos['liq_safe'] else '⚠️'
-                lines.append(f'  {coin}: SL距{pos["sl_pct"]:.1f}% | 每{ref}(2%风险)≈{c_s} | 爆仓{safe} | 20x爆仓距≈{pos["liq_pct"]:.1f}%')
+                lines.append(f'  {coin}: {pos_dir} | SL距{pos["sl_pct"]:.1f}% | 每{ref}(2%风险)≈{c_s} | 爆仓价{liq_price:.1f}(距{pos["liq_pct"]:.1f}%) | 安全{safe}')
     lines.append('')
     all_warnings = []
     seen_w = set()
@@ -2111,18 +2140,28 @@ def main():
                         macro_alert = str(lw)
                         break
             
-            # Extract position suggestion from resonance
+            # Extract position suggestion from resonance + near_bottom/near_top + V反保护
             position = a.get('position', '')
             if not position:
                 resonance = a.get('resonance', '')
+                near_bottom = a.get('near_bottom', False)
+                rsi_1d = (a.get('indicators', {}).get('1D', {}).get('rsi') or 50)
+                trend_1d = a.get('indicators', {}).get('1D', {}).get('trend', '')
+                macd_4h = a.get('macd_h_4h', 0)
                 if '观望' in str(resonance):
                     position = '观望'
-                elif '强' in str(resonance) and not a.get('near_bottom'):
+                elif '强' in str(resonance) or near_bottom:
                     position = '偏多'
                 elif '弱' in str(resonance):
                     position = '偏空'
                 else:
                     position = '观望（等确认）'
+                # L1: near_top 做空捷径
+                if position == '观望' and rsi_1d > 67 and trend_1d == '下降' and macd_4h < 0:
+                    position = '偏空'
+                # L3: V反保护
+                if position == '偏空' and near_bottom:
+                    position = '观望（near_bottom保护）'
             
             # Extract macro_external from extra data (fallback if regime_result not available)
             if not macro_external and 'extra' in a:

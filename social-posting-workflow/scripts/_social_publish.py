@@ -448,6 +448,17 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
 
     data_freshness = build_data_freshness(conn, coin)
 
+    # 方向判定 — 共振 + near_top + V反保护
+    trend_1d = indicators['1D'].get('trend', '')
+    rsi_1d_val = indicators['1D'].get('rsi')
+    position_raw = '偏多' if '强' in str(resonance) else ('偏空' if '弱' in str(resonance) else '观望')
+    # L1: near_top 做空捷径
+    if position_raw == '观望' and rsi_1d_val and rsi_1d_val > 67 and trend_1d == '下降' and macd_h_4h is not None and macd_h_4h < 0:
+        position_raw = '偏空'
+    # L3: V反保护
+    if position_raw == '偏空' and near_bottom:
+        position_raw = '观望（near_bottom保护）'
+    
     return {
         'coin': coin,
         'ticker': ticker,
@@ -461,6 +472,7 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
         'bottom_note': bottom_note,
         'near_bottom': near_bottom,
         'resonance': resonance,
+        'position': position_raw,
         'risks': risks,
         'rsi_4h': rsi_4h, 'rsi_1h': rsi_1h,
         'macd_h_4h': macd_h_4h, 'macd_h_1h': macd_h_1h,
@@ -553,41 +565,63 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
     lines.append(f'📍 BTC 支撑 {s_btc} | 阻力 {r_btc}')
     lines.append(f'📍 ETH 支撑 {s_eth} | 阻力 {r_eth}')
 
-    # 入场/止损/止盈/RR
+    # 入场/止损/止盈/RR — P1b: 用 ATR 缓冲，区分多空
     try: btc_entry_f = float(btc_p) if btc_p != '?' else 0
     except Exception: btc_entry_f = 0
     try: eth_entry_f = float(eth_p) if eth_p != '?' else 0
     except Exception: eth_entry_f = 0
-    btc_sl_val = int(btc_near_s[0] * 0.99) if btc_near_s and btc_entry_f else 0
-    eth_sl_val = int(eth_near_s[0] * 0.985) if eth_near_s and eth_entry_f else 0
-    btc_tp_val = int(btc_near_r[0]) if btc_near_r else 0
-    eth_tp_val = int(eth_near_r[0]) if eth_near_r else 0
-    if btc_entry_f and btc_sl_val and btc_tp_val:
-        btc_rr = round((btc_tp_val - btc_entry_f) / (btc_entry_f - btc_sl_val), 1)
-        btc_rr_str = f'{btc_rr:.1f}' if btc_rr > 0 else '?'
-    else:
-        btc_rr_str = '?'
-    if eth_entry_f and eth_sl_val and eth_tp_val:
-        eth_rr = round((eth_tp_val - eth_entry_f) / (eth_entry_f - eth_sl_val), 1)
-        eth_rr_str = f'{eth_rr:.1f}' if eth_rr > 0 else '?'
-    else:
-        eth_rr_str = '?'
+    
+    btc_atr = btc.get('indicators', {}).get('4H', {}).get('atr', btc_entry_f * 0.02)
+    eth_atr = eth.get('indicators', {}).get('4H', {}).get('atr', eth_entry_f * 0.02)
     btc_pos = btc.get('position', '观望')
     eth_pos = eth.get('position', '观望')
+    
+    def _calc_sl_tp_pair(entry, near_s, near_r, atr, pos_label):
+        """方向感知 SL/TP 计算"""
+        if not entry or not near_s or not near_r or not atr:
+            return 0, 0, '?'
+        if '空' in str(pos_label):
+            sl = int(near_r[0] + atr * 0.5)
+            tp = int(near_s[0])
+        else:
+            sl = int(near_s[0] - atr * 0.5)
+            tp = int(near_r[0])
+        if entry <= 0 or abs(entry - sl) <= 0:
+            return sl, tp, '?'
+        rr = abs(tp - entry) / abs(entry - sl)
+        return sl, tp, f'{rr:.1f}' if rr > 0 else '?'
+    
+    btc_sl_val, btc_tp_val, btc_rr_str = _calc_sl_tp_pair(
+        btc_entry_f, btc_near_s, btc_near_r, btc_atr, btc_pos)
+    eth_sl_val, eth_tp_val, eth_rr_str = _calc_sl_tp_pair(
+        eth_entry_f, eth_near_s, eth_near_r, eth_atr, eth_pos)
+    
     btc_dir_label = '偏多' if '多' in str(btc_pos) else ('偏空' if '空' in str(btc_pos) else '观望')
     eth_dir_label = '偏多' if '多' in str(eth_pos) else ('偏空' if '空' in str(eth_pos) else '观望')
     
     lines.append(f'')
-    lines.append(f'🎯 BTC {btc_dir_label} | 入场{int(btc_entry_f):,} | 止损{btc_sl_val:,} | 止盈{btc_tp_val:,} | RR 1:{btc_rr_str}' + (' ⚠️' if btc_rr_str != '?' and float(btc_rr_str) < 1.0 else ''))
-    lines.append(f'🎯 ETH {eth_dir_label} | 入场{eth_entry_f:.0f} | 止损{eth_sl_val} | 止盈{eth_tp_val} | RR 1:{eth_rr_str}' + (' ⚠️' if eth_rr_str != '?' and float(eth_rr_str) < 1.0 else ''))
+    # 观望时不输出 SL/TP 行
+    if btc_dir_label != '观望' and btc_entry_f and btc_sl_val and btc_tp_val:
+        rr_warn_btc = ' ⚠️' if btc_rr_str != '?' and float(btc_rr_str) < 1.5 else ''
+        lines.append(f'🎯 BTC {btc_dir_label} | 入场{int(btc_entry_f):,} | 止损{btc_sl_val:,} | 止盈{btc_tp_val:,} | RR 1:{btc_rr_str}{rr_warn_btc}')
+    if eth_dir_label != '观望' and eth_entry_f and eth_sl_val and eth_tp_val:
+        rr_warn_eth = ' ⚠️' if eth_rr_str != '?' and float(eth_rr_str) < 1.5 else ''
+        lines.append(f'🎯 ETH {eth_dir_label} | 入场{eth_entry_f:.0f} | 止损{eth_sl_val} | 止盈{eth_tp_val} | RR 1:{eth_rr_str}{rr_warn_eth}')
 
-    # 结语
-    if fg_val and fg_val < 25:
-        lines.append(f'')
-        lines.append(f'💬 FG={fg_val}极度恐惧——历史上这个位置做空的都成了燃料。')
+    # 结语 — 根据 BTC 方向动态切换
+    lines.append(f'')
+    if btc_dir_label == '偏空':
+        lines.append(f'💬 {regime}共振偏弱，顺势而为不猜底。')
+    elif btc_dir_label == '偏多':
+        if fg_val and fg_val < 25:
+            lines.append(f'💬 FG={fg_val}极度恐惧——历史上这个位置做空的都成了燃料。')
+        else:
+            lines.append(f'💬 {regime}共振偏强，顺势而为。')
     else:
-        lines.append(f'')
-        lines.append(f'💬 {regime}不打逆风局，共振方向就是最小阻力线。')
+        if fg_val and fg_val < 25:
+            lines.append(f'💬 FG={fg_val}极度恐惧——等确认信号再入场。')
+        else:
+            lines.append(f'💬 {regime}不打逆风局，共振方向就是最小阻力线。')
 
     lines.append('')
     lines.append('🤖 五系统AI分析，仅供参考')
