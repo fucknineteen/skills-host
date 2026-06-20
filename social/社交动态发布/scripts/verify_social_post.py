@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from _shared import BJT
 
 ANALYSES_FILE = '/root/.hermes/trade_review/social_analyses.json'
-ANALYSIS_SCRIPT = '/root/.hermes/trade_review/analysis_template.py'
+PUBLISH_SCRIPT = '/root/.hermes/trade_review/publish_social.py'
 MAX_AGE_MIN = 120  # 分析记录最大允许年龄（分钟）
 
 # ── 容差 ────────────────────────────────────────────────
@@ -86,16 +86,17 @@ def verify_structured(post_text, analyses):
         rec = analyses.get(coin, {})
         if not rec:
             continue
-        kt = rec.get('kline_table', {})
+        kt = rec.get('indicators', {})  # social_analyses.json 用 indicators 而非 kline_table
         k1h = kt.get('1H', {})
         k4h = kt.get('4H', {})
-        vp = rec.get('session_vp', {})
+        vp = rec.get('session_vp', rec.get('vp_data', {}))  # 兼容新旧键名
         me = rec.get('macro_external', {})
         wy = rec.get('wyckoff_data', {})
-        pat = rec.get('kline_pattern_times', {})
+        # kline_patterns 格式: {'patterns': [...], 'summary': '...', 'bars_used': {...}}
+        pat_raw = rec.get('kline_patterns', {})
 
         # ── 结构化字段：🕐 行 ──
-        price = k1h.get('close')
+        price = k1h.get('last_close')  # indicators 里用 last_close 而非 close
         if price:
             m = re.search(rf'{coin}\s*\$([\d,.]+)', post_text)
             add_check(f'{coin}现价', m.group(1) if m else None, f'{price:.2f}', TOL_PRICE_PCT)
@@ -109,8 +110,9 @@ def verify_structured(post_text, analyses):
                 add_check('FG', m.group(1) if m else None, str(fg_val))
 
         # ── 结构化字段：📍 行 ──
-        support = rec.get('support', [])
-        resistance = rec.get('resistance', [])
+        levels_4h = rec.get('levels_4h', {})
+        support = levels_4h.get('lows', [])
+        resistance = levels_4h.get('highs', [])
         if len(support) >= 2:
             m = re.search(rf'📍\s*{coin}\s*支撑\s*([\d.]+)→([\d.]+)', post_text)
             add_check(f'{coin} S1', m.group(1) if m else None, f'{support[0]:.2f}', TOL_PRICE_PCT)
@@ -154,8 +156,8 @@ def verify_structured(post_text, analyses):
         macd_1h = round(k1h.get('macd_h', 0))
         adx_4h = round(k4h.get('adx', 0))
         adx_1h = round(k1h.get('adx', 0))
-        pct_b_4h = round(k4h.get('pct_b', 0))
-        pct_b_1h = round(k1h.get('pct_b', 0))
+        pct_b_4h = round(k4h.get('bb', {}).get('pct_b', 0))  # indicators 里 pct_b 嵌套在 bb 下
+        pct_b_1h = round(k1h.get('bb', {}).get('pct_b', 0))
 
         indicators = [
             (f'{coin} RSI 4H', f'{coin}.*?RSI.*?4H', rsi_4h),
@@ -219,6 +221,16 @@ def verify_structured(post_text, analyses):
                            'found' if found else 'missing', None))
 
         # ── 叙述字段：K线形态 ──
+        # pat_raw 格式: {'patterns': [(tf, date_str, name, desc), ...], 'summary': '...'}
+        # 转为旧版 dict 格式供核验循环使用
+        pat = {}
+        if isinstance(pat_raw, dict) and 'patterns' in pat_raw:
+            for p_tuple in pat_raw['patterns']:
+                if len(p_tuple) >= 3:
+                    tf, date_str, p_name = p_tuple[0], p_tuple[1], p_tuple[2]
+                    pat[p_name] = f'{p_name}@{date_str}'
+        elif isinstance(pat_raw, dict):
+            pat = pat_raw  # 兼容旧版 dict 格式
         for p_name, p_val in pat.items():
             if p_val:
                 found, _ = _check_near(post_text, p_name, p_val.replace('@', ''), radius=60)
@@ -272,9 +284,9 @@ def get_analysis_from_cache(coins):
 
 
 def run_analysis(coins):
-    """回退: 跑 analysis_template（带 --no-sync 跳过重复同步）"""
-    r = subprocess.run(['python3', ANALYSIS_SCRIPT, '--no-sync'] + coins,
-                       capture_output=True, text=True, timeout=120,
+    """回退: 跑 publish_social.py --verify-only 生成 social_analyses.json"""
+    r = subprocess.run(['python3', PUBLISH_SCRIPT, '--verify-only'] + coins,
+                       capture_output=True, text=True, timeout=180,
                        cwd='/root/.hermes/trade_review')
     return r.stdout
 
@@ -299,14 +311,14 @@ if __name__ == '__main__':
     coins_list = sorted(coins)
     print(f'🔍 核验动态 ({len(text)}字, {",".join(coins_list)})')
 
-    # 从 analyses.json 加载数据
+    # 从 social_analyses.json 加载数据
     analyses = _load_analyses()
     if not analyses:
         print(f'  ⏳ 缓存过期/缺失，回退实时分析...')
         run_analysis(coins_list)
         analyses = _load_analyses()
     else:
-        print(f'  📦 从缓存读取 (analyses.json, ≤{MAX_AGE_MIN}min)')
+        print(f'  📦 从缓存读取 (social_analyses.json, ≤{MAX_AGE_MIN}min)')
 
     if not analyses:
         print(f'  ❌ 无法加载分析数据')

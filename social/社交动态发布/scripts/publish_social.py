@@ -7,6 +7,7 @@
     python3 publish_social.py BTC ETH          # 指定币种
     python3 publish_social.py --all             # 全量
     python3 publish_social.py --coins BTC ETH   # 指定币种（长格式）
+    python3 publish_social.py --verify-only BTC # 仅分析+保存到 social_analyses.json（供核验回退用）
 """
 import os, sys, json, subprocess, time, threading
 from datetime import datetime, timezone, timedelta
@@ -176,6 +177,9 @@ def step_save(draft, analyses, regime_result):
 def main():
     # 解析参数
     args = sys.argv[1:]
+    verify_only = '--verify-only' in args
+    if verify_only:
+        args = [a for a in args if a != '--verify-only']
     if '--all' in args:
         coins = ['BTC', 'ETH', 'SOL', 'DOGE']
     elif '--coins' in args:
@@ -355,6 +359,11 @@ def main():
                 os.unlink(lock_file)
             except Exception:
                 pass
+
+    # --verify-only 模式：仅生成 social_analyses.json，跳过后续步骤
+    if verify_only:
+        print(f'  ✅ --verify-only 完成，已更新 social_analyses.json')
+        return
 
     # 宏观数据已在并行阶段拉取（FG + regime）
 

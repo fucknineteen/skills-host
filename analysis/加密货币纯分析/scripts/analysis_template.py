@@ -2069,7 +2069,7 @@ def main():
                 # Flash news (快讯) — 2026-06-20 新增
                 "flash_news": flash_news,
                 # VP data
-                "vp_data": vp_data,
+                "session_vp": vp_data,
                 # Order flow
                 "order_flow": order_flow,
                 # Wyckoff data
