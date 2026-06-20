@@ -120,11 +120,20 @@ def verify_structured(post_text, analyses):
             add_check(f'{coin} R1', m.group(1) if m else None, f'{resistance[0]:.2f}', TOL_PRICE_PCT)
             add_check(f'{coin} R2', m.group(2) if m else None, f'{resistance[1]:.2f}', TOL_PRICE_PCT)
 
-        # ── 结构化字段：🎯 行 ──
+        # ── 结构化字段：🎯 行（观望时跳过 — 模板规定不输出）──
         sl = rec.get('sl_val')
         tp = rec.get('tp_val')
         rr = rec.get('rr_str')
         entry = rec.get('entry_price')
+        position = rec.get('position', '')
+        
+        # 观望方向 → 文案不应有 🎯 行，跳过校验
+        if '观望' in str(position):
+            # 检查文案是否误加了 🎯 行（不应出现）
+            if re.search(rf'🎯\s*{coin}', post_text):
+                issues.append(f'⚠️ {coin} 方向为观望但文案误加了 🎯 行')
+            continue
+        
         if entry:
             m = re.search(rf'🎯\s*{coin}.*?入场([\d.]+)', post_text)
             add_check(f'{coin}入场', m.group(1) if m else None, f'{entry:.2f}', TOL_PRICE_PCT)
