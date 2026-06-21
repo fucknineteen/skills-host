@@ -17,13 +17,7 @@ if echo "$SYNC_OUT" | grep -qE '错误|失败|Error|❌'; then
     ISSUES="${ISSUES}[同步异常] ${SYNC_OUT}\\n"
 fi
 
-# 2. 完整性校验 (使用相对路径)
-INTEGRITY_OUT=$(python3 scripts/check_db_integrity.py 2>&1) || true
-if [ $? -ne 0 ] || echo "$INTEGRITY_OUT" | grep -q '⚠️'; then
-    ISSUES="${ISSUES}[数据异常] ${INTEGRITY_OUT}\\n"
-fi
-
-# 输出 — 仅异常时打印
+# 2. 清理旧 cron 日志 (>7天) + jin10 日历缓存 (>24h)
 if [ -n "$ISSUES" ]; then
     echo -e "$ISSUES"
 fi

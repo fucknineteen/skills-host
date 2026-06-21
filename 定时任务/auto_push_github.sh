@@ -64,11 +64,10 @@ for f in analysis_altcoin.py review_altcoin.py scan_daytrade_coins.py; do
 done
 
 # 辅助脚本（分析/复盘/验证）
-for f in inject_lessons.py price_path_report.py check_db_integrity.py verify_workflow.py; do
+for f in inject_lessons.py price_path_report.py verify_workflow.py; do
     case "$f" in
         inject_lessons.py) dest="$MIRROR/分析/加密货币纯分析/scripts/$f" ;;
         price_path_report.py) dest="$MIRROR/社交/社交动态发布/scripts/$f" ;;
-        check_db_integrity.py) dest="$MIRROR/社交/社交动态发布/scripts/$f" ;;
         verify_workflow.py) dest="$MIRROR/社交/社交动态发布/scripts/$f" ;;
     esac
     if [ -f "$TRADE_REVIEW/$f" ] || [ -f "$TRADE_REVIEW/scripts/$f" ]; then
