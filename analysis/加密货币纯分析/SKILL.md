@@ -5,10 +5,11 @@ description: 加密货币纯分析工作流。步骤：同步K线→执行analys
 
 # 加密货币分析步骤
 
-> 最后更新：2026-06-20
+> 最后更新：2026-06-21
 > 适用范围：BTC / ETH / SOL / DOGE
 > 核心脚本：`analysis_template.py` → 写入 `analyses.json`
 > 模板来源：`Obsidian/2-分析框架/分析报告模板v5.0.md`
+> 更新：第三轮审计 P3 修复（VP 键名 vp_data → session_vp），verify_social 字段映射文档已同步
 
 ---
 
@@ -112,7 +113,7 @@ python3 analysis_template.py BTC ETH
 | 威科夫阶段 | `wyckoff_data.phase` | "Markup (Phase D→E)" |
 | 威科夫置信度 | `wyckoff_data.confidence` | 60/77 等百分比 |
 | Spring/SOS/LPS/SC | `kline_pattern_times` + `wyckoff_data.events` | **以 JSON 为准，不信 stdout** |
-| VP POC/VAH/VAL | `vp_data.POC`/`VAH`/`VAL`（**24h 全天**，已改为全时段） | |
+| VP POC/VAH/VAL | `session_vp.POC`/`VAH`/`VAL`（**24h 全天**，已改为全时段） | |
 | 订单流费率 | `order_flow.funding_rate_pct` | ETH/BTC 共用 regime_cache，值可以相同 |
 | 订单流Taker | `order_flow.taker_buy_ratio` | |
 | FG | `macro_external.fg_actual` | |
@@ -159,7 +160,7 @@ python3 analysis_template.py BTC ETH
 [方向 + 入场 + 止损 + 止盈 + RR]
 ```
 
-**山寨币** → 使用庄控分析模板（详见 `analysis-template` skill）。
+**山寨币** → 使用庄控分析模板（详见 `分析结论模板` skill）。
 
 ### 3.4 禁止事项
 
@@ -244,15 +245,17 @@ for r in data[-10:]:
 
 ## 六、已知数据问题
 
-- **ETH 缺少 1h/4h/1d 数据**（仅 5m/15m/30m 可用）→ 详见 [`references/eth-data-gap.md`](references/eth-data-gap.md)。分析时需在结论中注明数据局限性。
+- **ETH 数据缺口（✅ 2026-06-21 已修复）**：此前 ETH 缺少 1h/4h/1d 数据（仅 5m/15m/30m 可用），现已由 hourly cron `monitor_and_sync.py BTC ETH` 自动补齐。目前 ETH 全周期 5m/15m/30m/1H/4H/1D 与 BTC 对齐。
 - **快讯集成架构**：详见 [`references/flash-news-integration.md`](references/flash-news-integration.md)。
 - **技能维护陷阱**：详见 [`references/skill-maintenance-pitfalls.md`](references/skill-maintenance-pitfalls.md)。
+- **代码审计已知问题**：详见 [`references/code-audit-2026-06-20.md`](references/code-audit-2026-06-20.md)（三轮共 17 项，前两轮 14 项全部已修复 ✅ 2026-06-20）。
+- **跨文件字段映射**：详见 [`references/cross-file-field-mapping.md`](references/cross-file-field-mapping.md)。analyses.json（flat_old）与 social_analyses.json（full_obj）使用不同字段命名约定——开发跨文件消费代码前必读。
 
-## 六、仓位方向逻辑（`position` 字段）
+## 七、仓位方向逻辑（`position` 字段）
 
 > 最后更新：2026-06-20 — P0/P1/P2/P3 仓位系统全量修复
 
-### 6.1 `position` 字段判定（写入 analyses.json）
+### 7.1 `position` 字段判定（写入 analyses.json）
 
 | 条件 | position 值 |
 |------|------------|
@@ -263,7 +266,7 @@ for r in data[-10:]:
 - 来源：`analysis_template.py` `analyze_single_coin()` + `_social_publish.py` wrapper（`analyze_single_coin` 返回值）
 - **2026-06-20 修复**：原逻辑 `'强' and not near_bottom → 偏多` 与 stdout 的 `near_bottom → 试多` 矛盾，已统一为 `near_bottom` 也触发偏多。
 
-### 6.2 stdout 仓位行判定（`_format_coin_section`）
+### 7.2 stdout 仓位行判定（`_format_coin_section`）
 
 **判定优先级**（L1297-1320）：
 
@@ -278,6 +281,8 @@ for r in data[-10:]:
 - `near_bottom == True` → `观望（near_bottom保护）`
 - 过去 8 根 4H 蜡烛内，当前价从最低点反弹 > 3% → `观望（反弹X%，V反保护）`
 
+> ⚠️ **第二轮审计发现**（2026-06-20）：V 反保护的 8 根 4H 反弹检测**最初仅在 `_format_coin_section`（stdout）实现**，`_social_publish.py` wrapper 和 `main()` record builder 只实现了 near_bottom 检测。**已修复**：三处全部补上反弹>3% 检测，与 `_format_coin_section` 对齐。
+
 **多空 SL/TP**：
 - 做多：`SL = lows_near[0] - atr_4h × 0.5`，`TP = highs_near[0]`
 - 做空：`SL = highs_near[0] + atr_4h × 0.5`，`TP = lows_near[0]`
@@ -285,7 +290,7 @@ for r in data[-10:]:
 
 **pos_dir guard 规则**：所有后续判断使用 `pos_dir.startswith('试')` 和 `pos_dir.startswith('观望')` 而非等值比较，以兼容带后缀的变体（如 `观望（near_bottom保护）`）。
 
-### 6.3 仓位公式（`calc_position`）
+### 7.3 仓位公式（`calc_position`）
 
 模块级常量（`analysis_template.py` L127-166）：
 
@@ -301,7 +306,7 @@ for r in data[-10:]:
 - **P2 修复**：mm_map 补全 SOL(2.0%) / DOGE(2.5%)
 - **P3 新增**：输出行含 `爆仓价{liq_price:.1f}(距{liq_pct}%)`
 
-### 6.4 社交动态文案的 SL/TP
+### 7.4 社交动态文案的 SL/TP
 
 `_social_publish.py` `generate_social_draft()` + `publish_social.py` fallback：
 
@@ -314,16 +319,16 @@ for r in data[-10:]:
 - `analyze_single_coin` 返回值新增 `position` 字段（L464）
 - `publish_social.py` fallback record 新增 `position` 字段
 
-### 6.5 B3/B4/X1 压制规则（⚠️ 仅文档，代码未执行）
+### 7.5 B3/B4/X1 压制规则（⚠️ 仅文档，代码未执行）
 
 `BTC_RULES` 配置字典（L66-71）中记录了 B3/B4 规则，但**没有任何代码引用它们**：
 - `B3`: `bias≤-2+FG<15 → 不给出做空建议` — **未执行**
 - `B4`: `RSI<20+FG<15 → 空头信号强制降级` — **未执行**
 - `X1`: `check_extreme_oversold()`（L100-104）存在但**仅写 lessons_warnings，不干预 direction**
 
-⚠️ **关键认识**：做空稀少不是因为 B3 封杀，而是因为共振评分门槛（见 6.7）。当 resonance='🔴偏弱' 时，做空信号**确实会被输出**（ETH 6/19-20 已验证）。
+⚠️ **关键认识**：做空稀少不是因为 B3 封杀，而是因为共振评分门槛（见 7.7）。当 resonance='🔴偏弱' 时，做空信号**确实会被输出**（ETH 6/19-20 已验证）。
 
-### 6.6 踩过的坑
+### 7.6 踩过的坑
 
 | 坑 | 表现 | 根因 | 修复 |
 |----|------|------|------|
@@ -342,8 +347,21 @@ for r in data[-10:]:
 | VP 开盘为空 | `session_vp()` 新交易时段前2h无数据 | 仅查当前8h时段15m蜡烛（≥8根才计算） | 改为24h全天（2026-06-20）|
 | 日历缓存过期 | 日常为空（cron 6h刷新间隔太长） | 仅读本地缓存文件 | 改为 MCP 实时+缓存+硬编码回退（2026-06-20）|
 | 底层函数重复实现 | 13/22 核心字段不一致，复盘取到不同源数据 | `_social_publish.py` 11 个函数有独立副本，与 `analysis_template` 实现不同 | 全量从 `analysis_template` import，`analyze_single_coin` 改为 wrapper（2026-06-20） |
+| V反保护不完整 | `social_analyses.json` 和 `analyses.json` 的 `position` 在反弹>3%时仍输出偏空 | wrapper 和 main() record builder 的 V反保护仅 near_bottom，缺 8 根 4H 反弹检测 | P0（二次审计）：三地全部补上反弹>3%检测（2026-06-20） |
+| position 三地重复计算 | 三个位置的 position 判定逻辑各不同，值可能不一致 | `_format_coin_section` / wrapper / main() 各自实现，分歧时 wrapper=`观望`、main()=`观望（等确认）` | P0 修复同步消解功能差异；position 值统一为 `观望（等确认）`（2026-06-20） |
+| `'观望' in resonance` 死代码 | 永假分支，resonance 不含 '观望' | main() L1994 检查 `'观望' in str(resonance)` | P2：删除分支，兜底由 else 处理（2026-06-20） |
+| 快讯 per-coin 重复（社交流） | `publish_social.py` 每个币调一次 `fetch_flash_news()` | wrapper `analyze_single_coin` 自行拉取快讯 | P2：移到 `publish_social.py` 循环外，通过参数传入 wrapper（2026-06-20） |
+| RR 不区分多空（main 记录层） | `analyses.json` 做空时 `sl_val/tp_val/rr_str` 始终按做多算，RR 永远是 `?` | main() 的 SL 固定取 lows[0]、TP 固定取 highs[0]，无方向分支 | P0（2026-06-20 审计）：读 `position` 区分——做空 SL=highs[0]×1.01, TP=lows[0], RR=(entry-tp)/(sl-entry) |
+| 快讯 per-coin 重复拉取 | 多币种分析时每个币都调一次 MCP 分页+搜索 | `fetch_flash_news()` 在循环内 | P2（2026-06-20 审计）：移到循环外，多币种共享 `_all_flash_news` |
+| 快讯分页/搜索同 try 块 | 搜索关键词异常会丢弃已获取的分页结果 | 单一大 try 包裹所有逻辑 | P2（2026-06-20 审计）：拆成独立 try 块 + `if all_items` 门控 |
+| VP 键名不一致 | `_social_publish` wrapper 存 `vp_data`，`analysis_template` main() 存 `session_vp` | 两套命名各自为政 | P2（2026-06-20 审计）：统一为 `session_vp`（3 文件联动） |
+| 文件锁 None 保护缺失 | 锁超时时 `os.close(None)` 静默 TypeError | finally 未判空 | P3（2026-06-20 审计）：加 `if lock_fd is not None` |
+| `has_saved_analyses` 硬编码 | 无论分析是否成功都写 social_analyses.json | 变量始终 True | P3（2026-06-20 审计）：改为 `len(analyses) > 0` |
+| verify_social_post 字段不兼容 | `verify_social_post.py` 读取 social_analyses.json 但期望 `kline_table`/`support`/`kline_pattern_times`（flat_old 格式），这些字段在 social_analyses.json 中不存在 → 约 40% 核验项静默跳过 | 双文件分离后未更新字段映射 | P1（第三轮审计 2026-06-21 已修复）：更新 verify_social_post.py 适配 social_analyses.json 字段名（indicators/levels_4h/kline_patterns/last_close/bb.pct_b） |
+| verify_social_post 回退路径死循环 | 数据缺失时运行 `analysis_template.py`（→ 写入 analyses.json），但后续仍读 social_analyses.json（→ 仍为空） | 回退脚本跑错目标文件 | P2（第三轮审计 2026-06-21 已修复）：publish_social.py 新增 `--verify-only` 模式，run_analysis() 改为调用它 |
+| analyses.json VP 键名漂移 | analyses.json 用 `vp_data`，social_analyses.json 用 `session_vp` | 两文件各自命名 | P3（第三轮审计 2026-06-21 已修复）：统一为 `session_vp`，verify_social_post.py 加向后兼容 |
 
-### 6.7 共振评分公式（`resonance` 如何决定做空/做多）
+### 7.7 共振评分公式（`resonance` 如何决定做空/做多）
 
 `analysis_template.py` `analyze_single_coin()`：
 
@@ -366,7 +384,7 @@ RSI_1d > 67 + 1D方向='下降' + MACD_h_4H < 0 → position='偏空'/'试空'
 
 > 📊 数据验证（2026-06-19/20）：4 条有 resonance 的记录中，ETH 2 次🔴偏弱、BTC 2 次🟡分歧。
 
-### 6.8 已知局限 & 待改进
+### 7.8 已知局限 & 待改进
 
 | 局限 | 影响 | 状态 |
 |------|------|------|
@@ -375,7 +393,7 @@ RSI_1d > 67 + 1D方向='下降' + MACD_h_4H < 0 → position='偏空'/'试空'
 | 做空入口 | 此前无 near_bottom 等价捷径 | ✅ 已实现：L1 near_top |
 | 社交动态方向标签硬编码 | 此前始终输出 偏多 | ✅ 已修复：读 position 字段动态切换 |
 
-### 6.9 MACD_4H vs MACD_1H 设计决策
+### 7.9 MACD_4H vs MACD_1H 设计决策
 
 **为什么用 4H 而非 1H**（2026-06-20 数据验证）：
 
@@ -392,7 +410,7 @@ ETH: 4H=空(-16)   1H=多(+2)    ⚡
 
 **结论**：4H MACD 保持不变。对应持有周期（6h-72h 复盘窗口），滤掉日内噪声。
 
-### 6.10 教训系统现状（2026-06-20 更新）
+### 7.10 教训系统现状（2026-06-20 更新）
 
 - `process_reviews.py` 有 `extract_lessons()` 函数和 `save_lessons_regime_aware()` 写入
 - `lessons.json` + `regimes/{regime}_lessons.json` 双轨存储
@@ -401,11 +419,11 @@ ETH: 4H=空(-16)   1H=多(+2)    ⚡
 - **无权重反馈**：教训系统是存档+上下文注入，不反馈到 `resonance` 评分权重（重量闭环待 2026-07-20 讨论）
 - **重型闭环设计**：详见 [references/weight-adjustment-framework.md](references/weight-adjustment-framework.md)，计划 2026-07-20 根据累计数据讨论
 
-## 七、相关技能
+## 八、相关技能
 
 | 技能 | 关系 |
 |------|------|
 | `社交动态发布` | 📖 发动态操作手册（分析结论消费方） |
-| `trade-review-workflow` | 三层复盘引擎（消费 analyses.json） |
-| `analysis-strict-output` | 分析输出核验纪律 |
-| `analysis-template` | 分析模板规范 |
+| `三层复盘引擎` | 三层复盘引擎（消费 analyses.json） |
+| `强制分析规范` | 分析输出核验纪律 |
+| `分析结论模板` | 分析模板规范 |

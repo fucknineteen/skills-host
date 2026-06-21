@@ -40,9 +40,9 @@ for r in reversed(data):
 | 威科夫 | `wyckoff_data.phase/confidence/detail` | BTC phase='Markup (Phase D->E)' confidence=60 |
 | 订单流FR | `order_flow.funding_rate_pct` | BTC funding_rate_pct=-0.00018 |
 | 订单流taker | `order_flow.taker_buy_ratio` | BTC taker_buy_ratio=1.044 |
-| VP POC | `vp_data.POC` | BTC POC=62439.1 |
-| VP VAH | `vp_data.VAH` | BTC VAH=62881.5 |
-| VP VAL | `vp_data.VAL` | BTC VAL=62284.3 |
+| VP POC | `session_vp.POC` | BTC POC=62439.1 |
+| VP VAH | `session_vp.VAH` | BTC VAH=62881.5 |
+| VP VAL | `session_vp.VAL` | BTC VAL=62284.3 |
 | FG | `macro_external.fg_actual` | FG=14 |
 | FG标签 | `macro_external.fg_label` | Extreme Fear |
 | DXY | `macro_external.dxy` | 100.83 |

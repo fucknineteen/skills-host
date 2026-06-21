@@ -281,7 +281,7 @@ if output_lines:
 - ✅ GitHub 自动推送（`auto_push_github.sh`，cron `*/5 * * * *`）已上线
 
 **遗留**：
-- 🟡 `gen_charts.py` Style 4 有 UnboundLocalError（详见 `social-posting-workflow` SKILL.md §10）
+- ✅ `gen_charts.py` 四 bug 修复（2026-06-21）：import json 缺失 + UnboundLocalError + RSI 键名不兼容 + Style 2 MACD 全 NaN（详见 `社交动态发布` SKILL.md §10.1）
 
 **2026-06-20 统一计算层（已完成）**：
 - ✅ `_social_publish.py` 重构：删除 326 行重复代码，`analyze_single_coin()` 改为 50 行 wrapper，底层统一调 `analysis_template.analyze_single_coin()`
