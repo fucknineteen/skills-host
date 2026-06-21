@@ -36,7 +36,7 @@ for f in sync_klines_cron.sh cron_review_process.sh regime_update.sh guard_jin10
 done
 
 # 加密货币纯分析 scripts
-for f in monitor_and_sync.py process_reviews.py analysis_template.py regime_detector.py _shared.py jin10_fallback.py; do
+for f in monitor_and_sync.py process_reviews.py analysis_template.py regime_detector.py _shared.py jin10_fallback.py massive_client.py; do
     if [ -f "$TRADE_REVIEW/$f" ]; then
         safe_copy "$TRADE_REVIEW/$f" "$MIRROR/分析/加密货币纯分析/scripts/$f"
     fi
