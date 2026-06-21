@@ -9,7 +9,7 @@ Styles:
   3 - 结构标注 (威科夫Spring/SOS, 支撑阻力带)
   4 - 社交卡片 (极简, 价格+关键位+FG徽章, 方形)
 """
-import sqlite3, sys, os, argparse
+import sqlite3, sys, os, argparse, json
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -157,7 +157,32 @@ def style_marketing(out_path):
     plt.setp(ax_bv.get_xticklabels(), rotation=0, ha='center', fontsize=6.5, color='#556677')
     plt.setp(ax_ev.get_xticklabels(), rotation=0, ha='center', fontsize=6.5, color='#556677')
     
-    badges = [('FG EXTREME FEAR', '#ff6666'), ('6-DAY UPTREND', '#00e676'), ('BREAKOUT CONFIRMED', '#ffaa00')]
+    # 从真实数据构建徽章
+    fg_val, fg_label = '?', ''
+    try:
+        analyses_file = '/root/.hermes/trade_review/social_analyses.json'
+        if not os.path.exists(analyses_file):
+            analyses_file = '/root/.hermes/trade_review/analyses.json'
+        if os.path.exists(analyses_file):
+            with open(analyses_file) as af:
+                records = json.load(af)
+            for r in records:
+                if r.get('coin') == 'FG':
+                    fg_val = r.get('fg_val', '?')
+                    fg_label = r.get('fg_label', '').upper()
+                    break
+    except Exception:
+        pass
+    fg_text = f'FG: {fg_val} {fg_label}' if fg_val != '?' else 'FG: ?'
+    up_days = conn.execute(
+        "SELECT COUNT(*) FROM (SELECT open,close FROM klines WHERE coin='BTC' AND timeframe='1D' ORDER BY ts DESC LIMIT 10) WHERE close>open"
+    ).fetchone()[0]
+    breached = 'BREAKOUT' if bc[-1] > RES else 'RANGE-BOUND'
+    badges = [
+        (fg_text, '#ff6666'),
+        (f'{up_days}/10 UP DAYS', '#00e676'),
+        (breached, '#ffaa00'),
+    ]
     for i, (text, color) in enumerate(badges):
         fig.text(0.97-i*0.15, 0.015, text, fontsize=7, color=color, fontweight='bold', fontfamily='monospace', ha='right',
                  bbox=dict(boxstyle='round,pad=0.3', facecolor=f'{color}15', edgecolor=f'{color}33', alpha=0.6))
@@ -172,8 +197,8 @@ def style_marketing(out_path):
 # ═══════════════════════════════════════════
 def style_dashboard(out_path):
     conn = _get_conn()
-    bd, bo, bh, bl, bc, bv = fetch(conn, 'BTC', '4H', 60)
-    ed, eo, eh, el, ec, ev = fetch(conn, 'ETH', '4H', 60)
+    bd, bo, bh, bl, bc, bv = fetch(conn, 'BTC', '4H', 100)
+    ed, eo, eh, el, ec, ev = fetch(conn, 'ETH', '4H', 100)
     
     btc_rsi = calc_rsi(bc, 14)
     eth_rsi = calc_rsi(ec, 14)
@@ -349,16 +374,31 @@ def style_card(out_path):
     
     # BTC levels
     ax.text(1, 6.5, f'R: ${b7h:,.0f}  |  S: ${int(btc_p*0.992):,}  |  Spring: ${b30l:,.0f}', fontsize=10, color='#8899aa', fontfamily='monospace')
-    # BTC daily stats
-    # 从 analyses.json 读取 RSI 1D 和费率
+    # 加载 social_analyses.json（优先）或 analyses.json（回退）
+    analyses_file = '/root/.hermes/trade_review/social_analyses.json'
+    if not os.path.exists(analyses_file):
+        analyses_file = '/root/.hermes/trade_review/analyses.json'
+    records = []
+    if os.path.exists(analyses_file):
+        try:
+            with open(analyses_file) as af:
+                records = json.load(af)
+        except Exception:
+            pass
+
+    # BTC daily stats — 从 JSON 读取 RSI 1D 和费率
     btc_rsi_1d = 50  # default
     btc_fr = 0
     for r in records:
         if r.get('coin') == 'BTCUSDT':
-            kt = r.get('kline_table', {})
+            # 兼容两种格式：social_analyses.json→indicators, analyses.json→kline_table
+            kt = r.get('indicators') or r.get('kline_table', {})
             k1d = kt.get('1D', {})
             btc_rsi_1d = round(k1d.get('rsi', 50), 1)
-            btc_fr = r.get('funding_rate_pct', 0)
+            # funding_rate_pct: social_analyses.json 在顶层，analyses.json 在 order_flow 内
+            btc_fr = r.get('funding_rate_pct')
+            if btc_fr is None:
+                btc_fr = r.get('order_flow', {}).get('funding_rate_pct', 0)
             break
     
     btc_fr_str = f'{btc_fr:.4f}%' if btc_fr else '0.0000%'
@@ -378,39 +418,30 @@ def style_card(out_path):
     ax.text(6.5, 3.8, f'{eth_change:+.1f}% today', fontsize=12, color=UP if eth_change>0 else DN, fontfamily='monospace')
     
     ax.text(1, 2.8, f'R: ${e7h:,.0f}  |  S: ${int(eth_p*0.988):,}  |  Spring: ${e30l:,.0f}', fontsize=10, color='#8899aa', fontfamily='monospace')
-    # 从 analyses.json 读取 ETH RSI 1D
+    # ETH RSI 1D — 兼容两种 JSON 格式
     eth_rsi_1d = 50
     for r in records:
         if r.get('coin') == 'ETHUSDT':
-            kt = r.get('kline_table', {})
+            kt = r.get('indicators') or r.get('kline_table', {})
             k1d = kt.get('1D', {})
             eth_rsi_1d = round(k1d.get('rsi', 50), 1)
             break
     
     ax.text(1, 2.4, f'ETH/BTC: {eth_p/btc_p:.4f}  |  RSI 1D: {eth_rsi_1d}', fontsize=9, color='#ffaa00', fontfamily='monospace')
     
-    # Footer badges — 优先读 social_analyses.json（full_obj），fallback analyses.json（flat_old）
+    # Footer badges — 复用上方已加载的 records
     macro = {}
-    analyses_file = '/root/.hermes/trade_review/social_analyses.json'
-    if not os.path.exists(analyses_file):
-        analyses_file = '/root/.hermes/trade_review/analyses.json'
-    if os.path.exists(analyses_file):
-        try:
-            with open(analyses_file) as af:
-                records = json.load(af)
-            for r in records:
-                me = r.get('macro_external', {})
-                if r.get('coin') == 'FG':
-                    macro['FG'] = r.get('fg_val', '?')
-                    macro['FG_LABEL'] = r.get('fg_label', '')
-                if me.get('btc_dominance') and 'BTC.D' not in macro:
-                    macro['BTC.D'] = me['btc_dominance']
-                if me.get('dxy') and 'DXY' not in macro:
-                    macro['DXY'] = me['dxy']
-                if me.get('vix') and 'VIX' not in macro:
-                    macro['VIX'] = me['vix']
-        except Exception:
-            pass
+    for r in records:
+        me = r.get('macro_external', {})
+        if r.get('coin') == 'FG':
+            macro['FG'] = r.get('fg_val', '?')
+            macro['FG_LABEL'] = r.get('fg_label', '')
+        if me.get('btc_dominance') and 'BTC.D' not in macro:
+            macro['BTC.D'] = me['btc_dominance']
+        if me.get('dxy') and 'DXY' not in macro:
+            macro['DXY'] = me['dxy']
+        if me.get('vix') and 'VIX' not in macro:
+            macro['VIX'] = me['vix']
     
     fg_val = macro.get('FG', '?')
     fg_label = macro.get('FG_LABEL', '')
