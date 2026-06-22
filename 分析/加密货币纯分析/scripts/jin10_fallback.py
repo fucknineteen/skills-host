@@ -69,7 +69,7 @@ def try_jin10_calendar():
                 if 'Authorization' in line and 'Bearer' in line:
                     parts = line.strip().split()
                     if len(parts) >= 3:
-                        token = parts[-1]
+                        token = parts[2].strip('"').strip("'")
                     break
         
         if not token or len(token) < 10:
@@ -293,7 +293,7 @@ def _jin10_mcp_session():
                 if 'Authorization' in line and 'Bearer' in line:
                     parts = line.strip().split()
                     if len(parts) >= 3:
-                        token = parts[-1]
+                        token = parts[2].strip('"').strip("'")
                     break
 
         if not token or len(token) < 10:
@@ -468,7 +468,7 @@ def fetch_flash_news():
                             if item_dt < cutoff:
                                 continue
                         except Exception:
-                            pass
+                            continue
                         score = _flash_relevance_score(item)
                         if score > 0:
                             all_items[url] = {**item, "relevance_score": score}
@@ -493,7 +493,7 @@ def fetch_flash_news():
                             if item_dt < cutoff:
                                 continue
                         except Exception:
-                            pass
+                            continue
                         score = _flash_relevance_score(item) + 2  # 搜索命中加分
                         if score > 0:
                             all_items[url] = {**item, "relevance_score": score}

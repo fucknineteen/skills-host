@@ -108,10 +108,10 @@ def _build_coin_result(coin, entry, direction, path, actual_sl=None):
         verdict = '🟡 横盘震荡'
         verdict_short = '横盘'
     elif change > THRESHOLD:
-        verdict = '✅ 做多正确' if '做多' in direction else ('❌ 做空错误' if '做空' in direction else '✅')
+        verdict = '✅ 做多正确' if ('做多' in direction and '做空' not in direction) else ('❌ 做空错误' if ('做空' in direction and '做多' not in direction) else '✅')
         verdict_short = '正确'
     else:
-        verdict = '❌ 做多错误' if '做空' in direction else ('✅ 做空正确' if '做空' in direction else '❌')
+        verdict = '❌ 做多错误' if ('做多' in direction and '做空' not in direction) else ('✅ 做空正确' if ('做空' in direction and '做多' not in direction) else '❌')
         verdict_short = '错误'
 
     # 优先用 direction 中解析出的实际 SL，回退到 entry*0.99

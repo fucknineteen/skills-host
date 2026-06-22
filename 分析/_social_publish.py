@@ -338,38 +338,19 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
     eth_resonance = eth.get('resonance', '')
 
     # FIX #1: unify SL/TP data source — use near_support/near_resistance (same as _format_coin_section)
-    # 如果 near_support/near_resistance 不存在（social_analyses.json record 未写入），
-    # 回退到 levels_4h，但优先使用 JSON 中已有的 sl_val/tp_val/rr_str 作为最终数据源
     btc_near_s = btc.get('near_support', []) or btc.get('levels_4h', {}).get('lows', [])
     btc_near_r = btc.get('near_resistance', []) or btc.get('levels_4h', {}).get('highs', [])
     eth_near_s = eth.get('near_support', []) or eth.get('levels_4h', {}).get('lows', [])
     eth_near_r = eth.get('near_resistance', []) or eth.get('levels_4h', {}).get('highs', [])
-    
-    # FIX: 如果 near_support/near_resistance 缺失，直接使用 JSON 中的 sl_val/tp_val/rr_str
-    # （publish_social.py L351 已用正确的 near_support 计算了这些值）
-    btc_sl_val = btc.get('sl_val')
-    btc_tp_val = btc.get('tp_val')
-    btc_rr_str = btc.get('rr_str')
-    eth_sl_val = eth.get('sl_val')
-    eth_tp_val = eth.get('tp_val')
-    eth_rr_str = eth.get('rr_str')
-    # 如果 near_support 缺失但有 sl_val/tp_val，用它们替代 L350-353 的生成
-    if not btc_near_s or not btc_near_r:
-        s_btc = f'{int(btc_sl_val)}' if btc_sl_val else '?'
-        r_btc = f'{int(btc_tp_val)}' if btc_tp_val else '?'
-    else:
-        s_btc = '→'.join(f'{int(x)}' for x in btc_near_s[:2])
-        r_btc = '→'.join(f'{int(x)}' for x in btc_near_r[:2])
-    if not eth_near_s or not eth_near_r:
-        s_eth = f'{int(eth_sl_val)}' if eth_sl_val else '?'
-        r_eth = f'{int(eth_tp_val)}' if eth_tp_val else '?'
-    else:
-        s_eth = '→'.join(f'{int(x)}' for x in eth_near_s[:2])
-        r_eth = '→'.join(f'{int(x)}' for x in eth_near_r[:2])
 
     regime = regime_result.get('regime', '')
     confidence = regime_result.get('confidence', 0)
     composite = regime_result.get('composite_score', 0)
+
+    s_btc = '→'.join(f'{int(x)}' for x in btc_near_s[:2]) if btc_near_s else '?'
+    r_btc = '→'.join(f'{int(x)}' for x in btc_near_r[:2]) if btc_near_r else '?'
+    s_eth = '→'.join(f'{int(x)}' for x in eth_near_s[:2]) if eth_near_s else '?'
+    r_eth = '→'.join(f'{int(x)}' for x in eth_near_r[:2]) if eth_near_r else '?'
 
     btc_ind = btc.get('indicators', {})
     eth_ind = eth.get('indicators', {})
@@ -473,9 +454,9 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
         else: mp.append(f'费率{funding_rate_pct:+.4f}%（空头略付钱，不极端）')
     else: mp.append('费率中性')
     if taker_buy_ratio:
-        if taker_buy_ratio > 0.97: mp.append('Taker买方吃单占优——主动买盘强')
-        elif taker_buy_ratio > 0.90: mp.append('Taker买方略占优——主动买盘稍多')
-        elif taker_buy_ratio > 0.85: mp.append('Taker买卖均衡——多空拉锯')
+        if taker_buy_ratio > 1.05: mp.append('Taker买方吃单占优——主动买盘强')
+        elif taker_buy_ratio > 0.97: mp.append('Taker买卖均衡——没人抢跑')
+        elif taker_buy_ratio > 0.90: mp.append('Taker卖方略占优——主动卖盘稍多')
         else: mp.append('Taker卖方主导——主动抛压明显')
     lines.append('；'.join(mp) + '。')
 

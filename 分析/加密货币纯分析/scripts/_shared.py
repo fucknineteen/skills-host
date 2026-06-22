@@ -72,11 +72,11 @@ def classify_price_path(candles, entry_price):
     max_drawdown = 0
     max_rally = 0
     for c in candles:
+        rally = (c[2] - running_max) / running_max * 100 if running_max > 0 else 0
+        max_rally = max(max_rally, rally)
         running_max = max(running_max, c[2])
         dd = (running_max - c[3]) / running_max * 100
         max_drawdown = max(max_drawdown, dd)
-        rally = (c[2] - running_max) / running_max * 100 if running_max > 0 else 0
-        max_rally = max(max_rally, rally)
 
     def ts_to_bj(ts_ms):
         return datetime.fromtimestamp(ts_ms / 1000, tz=BJT).strftime('%m-%d %H:%M')

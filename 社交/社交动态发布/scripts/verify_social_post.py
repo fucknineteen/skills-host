@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from _shared import BJT
 
 ANALYSES_FILE = '/root/.hermes/trade_review/social_analyses.json'
+REGIME_CACHE_FILE = '/root/.hermes/trade_review/.regime_cache.json'
 PUBLISH_SCRIPT = '/root/.hermes/trade_review/publish_social.py'
 MAX_AGE_MIN = 120  # 分析记录最大允许年龄（分钟）
 
@@ -32,42 +33,55 @@ def _check_near(text, keyword_regex, json_val, radius=80):
     start = max(0, idx - radius)
     end = min(len(text), idx + radius)
     snippet = text[start:end]
+    # Strip commas from both json_val and snippet to handle "64,200" in post text
     val_str = str(json_val).replace(',', '')
+    snippet_nocomma = snippet.replace(',', '')
     # 支持多种格式：15、15%、+15、$15、-535、小数
-    found = (val_str in snippet or f'{json_val}%' in snippet or f'${json_val}' in snippet)
+    found = (val_str in snippet_nocomma
+             or f'{json_val}%' in snippet_nocomma
+             or f'${json_val}' in snippet_nocomma)
     if not found and isinstance(json_val, (int, float)):
-        try:
-            found = f'{json_val:.1f}' in snippet
-        except (ValueError, TypeError):
-            pass
+        # Also try without currency/percent suffixes in comma-stripped context
+        found = val_str in snippet_nocomma
     return found, snippet[:60] if found else snippet[:60]
 
 def _load_analyses():
-    """加载 analyses.json，返回 {coin: latest_record} 映射。"""
+    """加载 analyses.json，返回 {coin: latest_record} 映射。按时间戳取最新。"""
     if not os.path.exists(ANALYSES_FILE):
         return {}
     with open(ANALYSES_FILE) as f:
         records = json.load(f)
     now = datetime.now(BJT)
     out = {}
+    out_ts = {}  # 记录每个币种的时间戳，确保取最新
     for r in records:
         coin = r.get('coin', '')
-        if not coin.endswith('USDT'):
+        coin_name = coin.replace('USDT', '') if coin.endswith('USDT') else coin
+        if not coin_name or coin_name in ('FG', 'REVIEW'):
             continue
         try:
             ts = datetime.fromisoformat(r['timestamp'])
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=BJT)
             age = (now - ts).total_seconds() / 60
             if age <= MAX_AGE_MIN:
-                coin_name = coin.replace('USDT', '')
-                if coin_name not in out:
+                if coin_name not in out_ts or ts > out_ts[coin_name]:
                     out[coin_name] = r
+                    out_ts[coin_name] = ts
         except Exception:
             continue
-    # FG record
+    # FG record — 按时间戳取最新（#7）
+    fg_candidates = []
     for r in records:
-        if r.get('coin') == 'FG' and r.get('fg_val'):
-            out['FG'] = r
-            break
+        # FIX: fg_val 可能为 0（极端恐惧），不能用 falsy 判断
+        if r.get('coin') == 'FG' and r.get('fg_val') is not None:
+            try:
+                fg_candidates.append((datetime.fromisoformat(r['timestamp']), r))
+            except Exception:
+                fg_candidates.append((datetime.min.replace(tzinfo=timezone.utc), r))
+    if fg_candidates:
+        fg_candidates.sort(key=lambda x: x[0])
+        out['FG'] = fg_candidates[-1][1]
     return out
 
 def verify_structured(post_text, analyses):
@@ -78,11 +92,13 @@ def verify_structured(post_text, analyses):
 
     def add_check(desc, post_val, json_val, tol=None):
         nonlocal checks
-        if json_val is None or json_val == '' or json_val == '?' or json_val == 0:
+        if json_val is None or json_val == '' or json_val == '?':
             return  # 跳过空值
         checks.append((desc, post_val, json_val, tol))
 
-    for coin in ['BTC', 'ETH']:
+    for coin in sorted(analyses.keys()):
+        if coin == 'FG':
+            continue
         rec = analyses.get(coin, {})
         if not rec:
             continue
@@ -91,6 +107,9 @@ def verify_structured(post_text, analyses):
         k4h = kt.get('4H', {})
         vp = rec.get('session_vp', rec.get('vp_data', {}))  # 兼容新旧键名
         me = rec.get('macro_external', {})
+        # macro_external: 优先JSON值,空时回退regime_cache
+        if not me or not any(me.values()):
+            me = _load_regime_macro()
         wy = rec.get('wyckoff_data', {})
         # kline_patterns 格式: {'patterns': [...], 'summary': '...', 'bars_used': {...}}
         pat_raw = rec.get('kline_patterns', {})
@@ -105,22 +124,23 @@ def verify_structured(post_text, analyses):
         if coin == 'BTC':
             fg_rec = analyses.get('FG', {})
             fg_val = fg_rec.get('fg_val')
-            if fg_val:
-                m = re.search(r'FG:(\d+)', post_text)
+            if fg_val is not None:
+                m = re.search(r'FG\s*:\s*(\d+)', post_text)
                 add_check('FG', m.group(1) if m else None, str(fg_val))
 
         # ── 结构化字段：📍 行 ──
-        levels_4h = rec.get('levels_4h', {})
-        support = levels_4h.get('lows', [])
-        resistance = levels_4h.get('highs', [])
+        # FIX: 优先使用 near_support/near_resistance（基于 ATR 带宽筛选的最近支撑阻力）
+        # fallback 到 levels_4h（旧数据源）
+        support = rec.get('near_support', []) or rec.get('levels_4h', {}).get('lows', [])
+        resistance = rec.get('near_resistance', []) or rec.get('levels_4h', {}).get('highs', [])
         if len(support) >= 2:
-            m = re.search(rf'📍\s*{coin}\s*支撑\s*([\d.]+)→([\d.]+)', post_text)
-            add_check(f'{coin} S1', m.group(1) if m else None, f'{support[0]:.2f}', TOL_PRICE_PCT)
-            add_check(f'{coin} S2', m.group(2) if m else None, f'{support[1]:.2f}', TOL_PRICE_PCT)
+            m = re.search(rf'📍\s*{coin}\s*支撑\s*([\d,.]+)\s*→\s*([\d,.]+)', post_text)
+            add_check(f'{coin} S1', m.group(1).replace(',', '') if m else None, f'{support[0]:.2f}', TOL_PRICE_PCT)
+            add_check(f'{coin} S2', m.group(2).replace(',', '') if m else None, f'{support[1]:.2f}', TOL_PRICE_PCT)
         if len(resistance) >= 2:
-            m = re.search(rf'📍\s*{coin}\s*.*?阻力\s*([\d.]+)→([\d.]+)', post_text)
-            add_check(f'{coin} R1', m.group(1) if m else None, f'{resistance[0]:.2f}', TOL_PRICE_PCT)
-            add_check(f'{coin} R2', m.group(2) if m else None, f'{resistance[1]:.2f}', TOL_PRICE_PCT)
+            m = re.search(rf'📍\s*{coin}\s*[^\n]*?阻力\s*([\d,.]+)\s*→\s*([\d,.]+)', post_text)
+            add_check(f'{coin} R1', m.group(1).replace(',', '') if m else None, f'{resistance[0]:.2f}', TOL_PRICE_PCT)
+            add_check(f'{coin} R2', m.group(2).replace(',', '') if m else None, f'{resistance[1]:.2f}', TOL_PRICE_PCT)
 
         # ── 结构化字段：🎯 行（观望时跳过 — 模板规定不输出）──
         sl = rec.get('sl_val')
@@ -129,56 +149,58 @@ def verify_structured(post_text, analyses):
         entry = rec.get('entry_price')
         position = rec.get('position', '')
         
-        # 观望方向 → 文案不应有 🎯 行，跳过校验
+        # 观望方向 → 跳过结构化 🎯 校验（无入场/止损/止盈数字），但仍检查叙事字段
         if '观望' in str(position):
-            # 检查文案是否误加了 🎯 行（不应出现）
-            if re.search(rf'🎯\s*{coin}', post_text):
-                issues.append(f'⚠️ {coin} 方向为观望但文案误加了 🎯 行')
-            continue
-        
-        if entry:
-            m = re.search(rf'🎯\s*{coin}.*?入场([\d.]+)', post_text)
-            add_check(f'{coin}入场', m.group(1) if m else None, f'{entry:.2f}', TOL_PRICE_PCT)
-        if sl:
-            m = re.search(rf'🎯\s*{coin}.*?止损(\d+)', post_text)
-            add_check(f'{coin}止损', m.group(1) if m else None, str(int(sl)))
-        if tp:
-            m = re.search(rf'🎯\s*{coin}.*?止盈(\d+)', post_text)
-            add_check(f'{coin}止盈', m.group(1) if m else None, str(int(tp)))
-        if rr:
-            m = re.search(rf'🎯\s*{coin}.*?RR\s*1:([\d.]+)', post_text)
-            add_check(f'{coin} RR', m.group(1) if m else None, rr, TOL_RATIO)
+            # 检查文案是否误加了带数字的 🎯 行（如「入场64200」出现在观望币种中）
+            m_obs = re.search(rf'🎯\s*{coin}[^\n]*?\d+', post_text)
+            if m_obs:
+                issues.append(f'  ⚠️ {coin} 方向为观望但文案误加了带数字的 🎯 行')
+            # 不 continue — 继续校验叙述字段（RSI/MACD/VP/费率等）
+        else:
+            if entry:
+                m = re.search(rf'🎯\s*{coin}[^\n]*?入场([\d,.]+)', post_text)
+                add_check(f'{coin}入场', m.group(1).replace(',', '') if m else None, f'{entry:.2f}', TOL_PRICE_PCT)
+            if sl:
+                m = re.search(rf'🎯\s*{coin}[^\n]*?止损([\d,.]+)', post_text)
+                add_check(f'{coin}止损', m.group(1).replace(',', '') if m else None, str(int(sl)))
+            if tp:
+                m = re.search(rf'🎯\s*{coin}[^\n]*?止盈([\d,.]+)', post_text)
+                add_check(f'{coin}止盈', m.group(1).replace(',', '') if m else None, str(int(tp)))
+            if rr:
+                m = re.search(rf'🎯\s*{coin}[^\n]*?RR\s*(?:1:)?([\d,.]+)', post_text)
+                add_check(f'{coin} RR', m.group(1).replace(',', '') if m else None, rr, TOL_RATIO)
 
-        # ── 叙述字段：指标上下文匹配 ──
-        rsi_4h = round(k4h.get('rsi', 0))
-        macd_4h = round(k4h.get('macd_h', 0))
-        rsi_1h = round(k1h.get('rsi', 0))
-        macd_1h = round(k1h.get('macd_h', 0))
-        adx_4h = round(k4h.get('adx', 0))
-        adx_1h = round(k1h.get('adx', 0))
-        pct_b_4h = round(k4h.get('bb', {}).get('pct_b', 0))  # indicators 里 pct_b 嵌套在 bb 下
-        pct_b_1h = round(k1h.get('bb', {}).get('pct_b', 0))
+        # ── 叙述字段：指标数值匹配（#21: 值匹配替代关键词正则，消除12个误报）──
+        rsi_4h = round(k4h.get('rsi', 0) or 0)
+        macd_4h = round(k4h.get('macd_h', 0) or 0)
+        rsi_1h = round(k1h.get('rsi', 0) or 0)
+        macd_1h = round(k1h.get('macd_h', 0) or 0)
+        adx_4h = round(k4h.get('adx', 0) or 0)
 
         indicators = [
-            (f'{coin} RSI 4H', f'{coin}.*?RSI.*?4H', rsi_4h),
-            (f'{coin} MACD_h 4H', f'{coin}.*?MACD.*?4H', macd_4h),
-            (f'{coin} ADX 4H', f'{coin}.*?(?:4H.*?ADX|ADX.*?4H).*?{adx_4h}', adx_4h),
-            (f'{coin} %b 4H', f'%b.*?{pct_b_4h}%', pct_b_4h),
+            (f'{coin} RSI 4H', rsi_4h),
+            (f'{coin} MACD_h 4H', macd_4h),
+            (f'{coin} ADX 4H', adx_4h),
+            # 1H indicators — template outputs RSI_1H and MACD_1H (publish_social.py L362-364)
+            (f'{coin} RSI 1H', rsi_1h),
+            (f'{coin} MACD_h 1H', macd_1h),
         ]
-        for desc, kw, val in indicators:
-            found, ctx = _check_near(post_text, kw.replace(f'{coin} ', ''), val)
-            if found:
-                checks.append((f'{desc}={val}', 'found', 'found', None))
-            else:
-                issues.append(f'  ⚠️ {desc}: 文案中未找到 {val} ({ctx})')
+        for desc, val in indicators:
+            if val is not None and val != '':
+                # Word-boundary check prevents false positives (e.g. '46' matching in '63460')
+                found = bool(re.search(r'\b' + re.escape(str(val)) + r'\b', post_text))
+                if found:
+                    checks.append((f'{desc}={val}', 'found', 'found', None))
+                else:
+                    issues.append(f'  ⚠️ {desc}: 文案中未找到 {val}')
 
         # ── 叙述字段：VP ──
-        poc = round(vp.get('POC', 0))
-        vah = round(vp.get('VAH', 0))
-        val = round(vp.get('VAL', 0))
-        for vp_name, vp_val in [('POC', poc), ('VAH', vah), ('VAL', val)]:
+        poc = round(vp.get('poc', 0))
+        vah = round(vp.get('vah', 0))
+        val_ = round(vp.get('val', 0))
+        for vp_name, vp_val in [('POC', poc), ('VAH', vah), ('VAL', val_)]:
             if vp_val:
-                found, ctx = _check_near(post_text, f'{coin}.*?{vp_name}', vp_val, radius=100)
+                found = str(vp_val) in post_text
                 checks.append((f'{coin} VP {vp_name}={vp_val}', 'found' if found else 'missing',
                                'found' if found else 'missing', None))
 
@@ -186,9 +208,8 @@ def verify_structured(post_text, analyses):
         fr_pct = rec.get('funding_rate_pct')
         if fr_pct is not None:
             fr_str = f'{fr_pct:.4f}%'
-            found, _ = _check_near(post_text, f'{coin}.*?费率', fr_str.replace('%', ''), radius=60)
-            if not found:
-                found, _ = _check_near(post_text, '费率', fr_str.replace('%', ''), radius=80)
+            # Use consistent formatting to avoid scientific-notation mismatch
+            found = f'{fr_pct:.4f}' in post_text or f'{fr_pct:.4f}%' in post_text
             checks.append((f'{coin} 费率={fr_str}', 'found' if found else 'missing',
                            'found' if found else 'missing', None))
 
@@ -198,13 +219,15 @@ def verify_structured(post_text, analyses):
             vix = me.get('vix')
             y10 = me.get('yield10')
             btcd = me.get('btc_dominance')
-            for m_name, m_key, m_val, m_rounded in [('DXY', 'DXY', dxy, f'{dxy:.2f}' if dxy else None),
-                                           ('VIX', 'VIX', vix, str(vix)),
-                                           ('10Y', '10Y', y10, str(y10)),
-                                           ('BTC.D', r'BTC\.D', btcd, str(btcd))]:
+            for m_name, m_val, m_rounded in [('DXY', dxy, round(dxy) if dxy else None),
+                                     ('VIX', vix, round(vix) if vix else None),
+                                     ('10Y', y10, round(y10) if y10 else None),
+                                     ('BTC.D', btcd, round(btcd) if btcd else None)]:
                 if m_val:
-                    found, ctx = _check_near(post_text, m_key, m_rounded, radius=40)
-                    if not found:
+                    found = str(m_rounded) in post_text if m_rounded is not None else False
+                    if found:
+                        checks.append((f'{coin} 宏观 {m_name}={m_val}', 'found', 'found', None))
+                    else:
                         issues.append(f'  ⚠️ {m_name}={m_val}: 文案中未找到')
 
         # ── 叙述字段：威科夫 ──
@@ -212,11 +235,19 @@ def verify_structured(post_text, analyses):
         wy_conf = wy.get('confidence', 0)
         wy_detail = wy.get('detail', '')
         if wy_phase:
-            found, _ = _check_near(post_text, '威科夫', wy_phase.split('(')[0].strip(), radius=120)
-            checks.append((f'{coin} 威科夫阶段', 'found' if found else 'missing',
-                           'found' if found else 'missing', None))
+            # 从 wyckoff_data.phase 中提取所有有意义的词（英文阶段名 + 阶段号）
+            # 例 "Markup (Phase D->E)" → 搜索 "Markup", "Phase D", "Phase E"
+            phase_clean = wy_phase.split('(')[0].strip()  # "Markup"
+            phase_words = [w for w in phase_clean.split() if len(w) > 2]
+            # 也提取括号内的阶段标识：Phase D, Phase E 等
+            phase_paren = re.findall(r'Phase\s+\w+', wy_phase)
+            search_terms = phase_words + phase_paren
+            if search_terms:
+                found = any(term.lower() in post_text.lower() for term in search_terms)
+                checks.append((f'{coin} 威科夫阶段={wy_phase}', 'found' if found else 'missing',
+                               'found' if found else 'missing', None))
         if wy_conf:
-            found, _ = _check_near(post_text, '威科夫', wy_conf, radius=120)
+            found = str(wy_conf) in post_text
             checks.append((f'{coin} 威科夫置信度={wy_conf}', 'found' if found else 'missing',
                            'found' if found else 'missing', None))
 
@@ -228,14 +259,19 @@ def verify_structured(post_text, analyses):
             for p_tuple in pat_raw['patterns']:
                 if len(p_tuple) >= 3:
                     tf, date_str, p_name = p_tuple[0], p_tuple[1], p_tuple[2]
-                    pat[p_name] = f'{p_name}@{date_str}'
+                    pat[(tf, p_name)] = f'{p_name}@{date_str}'
         elif isinstance(pat_raw, dict):
             pat = pat_raw  # 兼容旧版 dict 格式
-        for p_name, p_val in pat.items():
+        for key, p_val in pat.items():
             if p_val:
-                found, _ = _check_near(post_text, p_name, p_val.replace('@', ''), radius=60)
+                # Use pattern name (second element of tuple key or bare key for old format)
+                search_name = key[1] if isinstance(key, tuple) else key
+                # 跳过含 % 的格式占位符（如 %b），这些永远不会出现在模板中
+                if '%' in search_name:
+                    continue
+                found, _ = _check_near(post_text, re.escape(search_name), p_val.replace('@', ' '), radius=60)
                 if found:
-                    checks.append((f'{coin} {p_name}={p_val}', 'found', 'found', None))
+                    checks.append((f'{coin} {key}={p_val}', 'found', 'found', None))
 
     # ── 执行比较 ──
     ok = 0
@@ -251,7 +287,7 @@ def verify_structured(post_text, analyses):
         try:
             pv = float(str(post_val).replace(',', '').replace('$', ''))
             jv = float(str(json_val).replace(',', '').replace('$', ''))
-            if jv == 0:
+            if jv == 0 and pv == 0:
                 ok += 1
                 continue
             diff = abs(pv - jv) / abs(jv)
@@ -281,6 +317,25 @@ def get_analysis_from_cache(coins):
     except Exception:
         return None
     return "\n".join(json.dumps(r) for r in records)
+
+
+def _load_regime_macro():
+    """从 .regime_cache.json 读取宏观数据 (DXY/VIX/10Y/BTC.D)。
+    social_analyses.json 中 macro_external 始终为空，外部环境数据集中在 regime_cache 中。"""
+    if not os.path.exists(REGIME_CACHE_FILE):
+        return {}
+    try:
+        with open(REGIME_CACHE_FILE) as f:
+            regime = json.load(f)
+    except Exception:
+        return {}
+    me = regime.get('dimensions', {}).get('macro_external', {})
+    return {
+        'dxy': me.get('dxy'),
+        'vix': me.get('vix'),
+        'yield10': me.get('yield10'),
+        'btc_dominance': me.get('btc_dominance'),
+    }
 
 
 def run_analysis(coins):

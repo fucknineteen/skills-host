@@ -45,27 +45,58 @@ def read_token():
 
 def restore_token():
     """从 hex 备份恢复 token 到 config.yaml。"""
-    with open(HEXFILE) as f:
-        hex_str = f.read().strip()
-    token = bytes.fromhex(hex_str).decode()
+    try:
+        with open(HEXFILE) as f:
+            hex_str = f.read().strip()
+    except (OSError, IOError):
+        write_log("ERROR: hex file not found or unreadable")
+        return False
+    
+    try:
+        token = bytes.fromhex(hex_str).decode()
+    except ValueError:
+        write_log("ERROR: hex decode failed")
+        return False
+    
     if len(token) < 10:
         write_log("ERROR: hex decode invalid")
         return False
 
-    with open(CONFIG) as f:
-        lines = f.readlines()
+    try:
+        with open(CONFIG) as f:
+            lines = f.readlines()
+    except (OSError, IOError):
+        write_log("ERROR: config file not found or unreadable")
+        return False
 
     b = chr(66)+chr(101)+chr(97)+chr(114)+chr(101)+chr(114)  # "Bearer"
+    found = False
     for i, line in enumerate(lines):
         if b in line or "Bearer" in line:
             parts = line.strip().split()
             if len(parts) >= 3 and len(parts[-1]) <= 5:
                 indent = line[:len(line) - len(line.lstrip())]
                 lines[i] = f"{indent}Authorization: {b} {token}\n"
+                found = True
                 break
 
-    with open(CONFIG, 'w') as f:
-        f.writelines(lines)
+    if not found:
+        write_log("ERROR: Authorization header not found in config")
+        return False
+
+    # FIX: 原子写入 — 先写临时文件再 rename，避免 read-modify-write 竞态
+    tmp_config = CONFIG + '.tmp'
+    try:
+        with open(tmp_config, 'w') as f:
+            f.writelines(lines)
+        os.replace(tmp_config, CONFIG)  # atomic on same filesystem
+    except OSError as e:
+        write_log(f"ERROR: config write failed: {e}")
+        try:
+            os.unlink(tmp_config)
+        except OSError:
+            pass
+        return False
 
     write_log("REPAIRED: Token restored from hex")
     return True
@@ -113,8 +144,25 @@ def restart_gateway():
         except OSError:
             pass
 
-    with open(LOCKFILE, "w") as f:
-        f.write(str(time.time()))
+    # FIX: 原子创建 LOCKFILE — 用 os.open + O_EXCL 防止两个进程同时写入
+    fd = -1
+    try:
+        fd = os.open(LOCKFILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        os.write(fd, str(time.time()).encode())
+    except FileExistsError:
+        # 另一个进程已创建 — 重新检查冷却期
+        try:
+            last = os.path.getmtime(LOCKFILE)
+            if time.time() - last < LOCK_COOLDOWN:
+                return False, f"已在 {int(time.time() - last)}s 前重启，跳过"
+        except OSError:
+            pass
+        return False, "LOCKFILE 竞争失败，跳过"
+    except OSError as e:
+        return False, f"LOCKFILE 创建失败: {e}"
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
     try:
         result = subprocess.run(

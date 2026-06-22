@@ -1,15 +1,35 @@
 ---
 name: 加密货币纯分析
-description: 加密货币纯分析工作流。步骤：同步K线→执行analysis_template.py→从analyses.json逐项提取数据→按分析报告模板v5.0输出→标注来源。与大币种(标准分析模板)和山寨币(庄控分析模板)两套输出模板独立。
+description: 加密货币纯分析工作流。步骤：同步K线→执行analysis_template.py→从analyses.json逐项提取数据→按分析报告模板v5.0输出→标注来源。触发词：纯分析、分析行情、分析BTC、分析ETH。⚠️ 不是发动态——发动态用「社交动态发布」skill。与大币种(标准分析模板)和山寨币(庄控分析模板)两套输出模板独立。
 ---
 
 # 加密货币分析步骤
 
 > 最后更新：2026-06-21
-> 适用范围：BTC / ETH / SOL / DOGE
+> 适用范围：BTC / ETH / SOL / DOGE（ETH 全周期数据已于 2026-06-21 补齐）
 > 核心脚本：`analysis_template.py` → 写入 `analyses.json`
 > 模板来源：`Obsidian/2-分析框架/分析报告模板v5.0.md`
-> 更新：第三轮审计 P3 修复（VP 键名 vp_data → session_vp），verify_social 字段映射文档已同步
+> 更新：SL/TP 多层级优化（VAL/VAH→ATR→原逻辑，三文件联动）、ETH 数据缺口关闭、VP 键名 vp_data → session_vp、gen_charts.py 五 bug 修复、强制分析规范字段映射修正、发动态最终交付改为发给你确认（不自动发频道）、TP 回溯窗放宽 `[-8:]`→`[-32:]` + `get_levels(n=20)`→`(n=32)` 统一纯分析/社交管线（1H 排除、3天排除、5.3天确认最优）、实盘开仓全流程（市价单+SL/TP+交易日志）
+
+---
+
+---
+
+### ⛔ 执行前必查清单（每次分析前逐项过，漏一项 = 结论不可靠）
+
+| # | 检查项 | 错了会怎样 |
+|---|--------|-----------|
+| 1 | 已加载本 skill，下一步直接运行 `python3 analysis_template.py BTC ETH` | 停在这里不执行 |
+| 2 | 同步K线：`python3 monitor_and_sync.py BTC ETH` 确认无缺口 | 用过期数据分析 |
+| 3 | 运行分析：`python3 analysis_template.py BTC ETH` | 数据未更新 |
+| 4 | **所有数字从 `analyses.json` 逐字段提取**，禁止 stdout/记忆 | 编造数据（如上次"63188"） |
+| 5 | 大币种用标准分析模板 v5.0，山寨币用庄控模板——不可混用 | 格式错乱 |
+| 6 | 字段映射：`kline_table.{TF}.close`（非 `last_close`），`kline_table.{TF}.pct_b`（非 `bb.pct_b`） | 字段名取错→读空值 |
+| 7 | 每个数字写入结论前，回头看 JSON 确认 | 核验盲区藏假数据 |
+| 8 | `analyses.json` 和 `social_analyses.json` 是**两个独立文件**——读纯分析数据用前者 | 字段不兼容 |
+| 9 | 不输出模拟盘/仓位建议（除非用户明确要求） | 用户多次纠正 |
+| 10 | 写结论前加载教训：`cat .lesson_context.txt` | 忽略已验证的规律（如RSI<20不追空） |
+| 11 | 每个数字标注来源：JSON字段路径可追溯 | 找不到出处时混入编造数字 |
 
 ---
 
@@ -250,6 +270,10 @@ for r in data[-10:]:
 - **技能维护陷阱**：详见 [`references/skill-maintenance-pitfalls.md`](references/skill-maintenance-pitfalls.md)。
 - **代码审计已知问题**：详见 [`references/code-audit-2026-06-20.md`](references/code-audit-2026-06-20.md)（三轮共 17 项，前两轮 14 项全部已修复 ✅ 2026-06-20）。
 - **跨文件字段映射**：详见 [`references/cross-file-field-mapping.md`](references/cross-file-field-mapping.md)。analyses.json（flat_old）与 social_analyses.json（full_obj）使用不同字段命名约定——开发跨文件消费代码前必读。
+- **实盘开仓流程**：详见 [`references/live-trading-via-social-posts.md`](references/live-trading-via-social-posts.md)。从纯分析结论直接用 `place_live_orders.py` 挂 OKX 实盘限价单的标准操作流程（social_posts.json 格式要求 + 步骤）。
+- **实盘开仓全流程**（市价单 + SL/TP + 交易日志）：详见 [`references/live-trading-workflow.md`](references/live-trading-workflow.md)。🆕 2026-06-21 — 市价单优先、分步挂 SL/TP、`trade_journal.json` 追踪每笔交易的盈亏比。
+- **OKX 实盘账户查询**：详见 [`references/okx-live-account-query.md`](references/okx-live-account-query.md)。🆕 2026-06-22 — 三种查询方法（内置命令/api_call/curl直查），含时间戳格式陷阱和 base64 签名要点。
+- **1H vs 4H TP 对比**：详见 [`references/1h-vs-4h-tp-analysis.md`](references/1h-vs-4h-tp-analysis.md)。2026-06-21 结论：4H 优于 1H（噪声少 6 倍，结构分量重）。
 
 ## 七、仓位方向逻辑（`position` 字段）
 
@@ -265,17 +289,21 @@ for r in data[-10:]:
 
 - 来源：`analysis_template.py` `analyze_single_coin()` + `_social_publish.py` wrapper（`analyze_single_coin` 返回值）
 - **2026-06-20 修复**：原逻辑 `'强' and not near_bottom → 偏多` 与 stdout 的 `near_bottom → 试多` 矛盾，已统一为 `near_bottom` 也触发偏多。
+- **2026-06-22 修复（#5）**：stdout 做多条件 `near_bottom AND macd_4h>-50 AND rsi_1h<45` 与 JSON `near_bottom` 不一致 → 统一为 `'强' or near_bottom`，两处同一条件。
+- **2026-06-22 修复（#4/#6）**：wrapper 补上 `near_bottom→偏多` 路径和 `rsi_1d>65+MACD_4h<-50→偏空` 路径，三地方向判定对齐。
 
 ### 7.2 stdout 仓位行判定（`_format_coin_section`）
 
-**判定优先级**（L1297-1320）：
+**判定优先级**（L1297-1320，2026-06-22 全审计对齐）：
 
 | 优先级 | 条件 | pos_dir |
 |--------|------|---------|
-| 1 | resonance 含 `强` 或 (near_bottom + MACD>-50 + RSI_1h<45) | `试多` |
+| 1 | resonance 含 `强` 或 `a.get('near_bottom')` | `试多` |
 | 2 | resonance 含 `弱` 或 (RSI_1d>65 + MACD_4h<-50) | `试空` |
 | 3 | **near_top**：RSI_1d>67 + 1D方向='下降' + MACD_4h<0 | `试空` |
 | 4 | 其他 | `观望` |
+
+> **2026-06-22 修复（#5 回归）**：原条件 `near_bottom`（裸变量，NameError）→ `a.get('near_bottom')`。三地方向判定阈值已完全对齐（见 7.11）。
 
 **V 反保护**（L3，L1309-1320）：做空信号确定后，如满足以下任一条件则降级为观望：
 - `near_bottom == True` → `观望（near_bottom保护）`
@@ -283,10 +311,34 @@ for r in data[-10:]:
 
 > ⚠️ **第二轮审计发现**（2026-06-20）：V 反保护的 8 根 4H 反弹检测**最初仅在 `_format_coin_section`（stdout）实现**，`_social_publish.py` wrapper 和 `main()` record builder 只实现了 near_bottom 检测。**已修复**：三处全部补上反弹>3% 检测，与 `_format_coin_section` 对齐。
 
-**多空 SL/TP**：
-- 做多：`SL = lows_near[0] - atr_4h × 0.5`，`TP = highs_near[0]`
-- 做空：`SL = highs_near[0] + atr_4h × 0.5`，`TP = lows_near[0]`
+**多空 SL/TP — 多层级优化**（🆕 2026-06-21）：
+
+原公式 `SL = 最近低点 - ATR×0.5` 在价格已从 Spring 低点大幅反弹后（如反弹 3.5%），SL 会被拖到极远处（RR<0.8）。改三层候选择优：
+
+| 优先级 | 做多候选 | 做空候选 | 说明 |
+|--------|----------|----------|------|
+| ① VAL/VAH 锚点 | `sl = VAL - atr_4h × 0.3` | `sl = VAH + atr_4h × 0.3` | 价值区边界 + 微缓冲，结构失效即离场 |
+| ② ATR 入口锚点 | `sl = entry - atr_4h × 1.5` | `sl = entry + atr_4h × 1.5` | 纯波动率止损，不依赖结构 |
+| ③ 原逻辑（保底） | `sl = lows_near[0] - atr_4h × 0.5` | `sl = highs_near[0] + atr_4h × 0.5` | VAL/VAH 缺失或异常时回退 |
+
+**选则**：距 entry 最近且 RR ≥ 1.2 的候选 → 全不满足则取最近。
+**改动文件**：`analysis_template.py` L1313-1362、`_social_publish.py` L333-397、`publish_social.py` L277-348（三处均同步）。
+
+**TP 优化：ATR 倍数 vs 绝对高点**（🆕 2026-06-21）：
+
+`highs_near[0]` 在 Spring 后反弹环境可能给出过远的目标（如 66790 需 3.9% 涨幅），FG=23 + 1D RSI<45 时难以达到。改用 `entry + ATR_4H × 1.5` 锚定波动率：
+
+| 环境 | TP 算法 | 效果 |
+|------|---------|------|
+| 正常/强势 | `highs_near[0]`（放宽回溯后的最近阻力） | ✅ 有结构意义 |
+| 极端恐惧/低 RSI | `entry + ATR_4H × 1.5` | ✅ 更易触及，RR 仍 ≥ 1.5 |
+
+示例：BTC entry=64268，ATR_4H=1318，ATR×1.5=1977 → TP=66244（距入场 3.1%，RR=1.89）。相比绝对高点 66790（3.9%），66244 在 1~2 天内更大概率触及。
+
+**注意**：选 ATR 倍数时从 1.0/1.2/1.5 候选中取 RR ≥ 1.5 的最小倍率，避免 TP 过近。
+
 - entry 用 `ticker.last`（现价）
+- 做多 SL 必须 < entry，做空 SL 必须 > entry（候选剔除）
 
 **pos_dir guard 规则**：所有后续判断使用 `pos_dir.startswith('试')` 和 `pos_dir.startswith('观望')` 而非等值比较，以兼容带后缀的变体（如 `观望（near_bottom保护）`）。
 
@@ -360,6 +412,8 @@ for r in data[-10:]:
 | verify_social_post 字段不兼容 | `verify_social_post.py` 读取 social_analyses.json 但期望 `kline_table`/`support`/`kline_pattern_times`（flat_old 格式），这些字段在 social_analyses.json 中不存在 → 约 40% 核验项静默跳过 | 双文件分离后未更新字段映射 | P1（第三轮审计 2026-06-21 已修复）：更新 verify_social_post.py 适配 social_analyses.json 字段名（indicators/levels_4h/kline_patterns/last_close/bb.pct_b） |
 | verify_social_post 回退路径死循环 | 数据缺失时运行 `analysis_template.py`（→ 写入 analyses.json），但后续仍读 social_analyses.json（→ 仍为空） | 回退脚本跑错目标文件 | P2（第三轮审计 2026-06-21 已修复）：publish_social.py 新增 `--verify-only` 模式，run_analysis() 改为调用它 |
 | analyses.json VP 键名漂移 | analyses.json 用 `vp_data`，social_analyses.json 用 `session_vp` | 两文件各自命名 | P3（第三轮审计 2026-06-21 已修复）：统一为 `session_vp`，verify_social_post.py 加向后兼容 |
+| SL 锚点用绝对最低点致距入场过远 | BTC 从 Spring 低点 62222 反弹 3.5% 到 64384 后，SL=62222-ATR×0.5=61559，距入场 2825 点 (4.4%)，RR=0.72 | `lows_near[0]` 是绝对最低点而非最近支撑 | 🆕 2026-06-21：三段文件改为三层候选择优（VAL/VAH→ATR→原逻辑），选距 entry 最近且 RR≥1.2 者。BTC SL 缩至 62920（距入场 1571 点） |
+| **TP 数据源分歧** | `_format_coin_section`(stdout) TP=64447（`highs_near[0]`，仅已收盘 4H 蜡烛，且限 `[-8:]`=32h）；`publish_social.py` 和 `analyses.json` flat_old TP=64775（`levels_4h.highs[0]`，含当前未收盘蜡烛）。差距 328 点，纯分析终端输出与 analyses.json 不一致 | 三处 TP 来源不同——`highs_near` 用 closed 4H candle highs 且受 ATR band 过滤 + `[-8:]` 限制，`levels_4h` 是全量高低点含当前蜡烛 | ✅ 2026-06-21 三步修复：(1) `closed_4h[-8:]` → `closed_4h[-32:]`（≈5.3天），BTC TP 从 64447 升至 66790（RR 0.01→2.5）；(2) `get_levels('4H')` → `get_levels('4H', n=32)`，使 `levels_4h` 与 `highs_near` 对齐同一窗口；(3) flat_old 导出不再独立重算 SL/TP/RR，改为直接读 `a['_sl']`/`a['_tp']`/`a['_rr']`（`_format_coin_section` 已算好的多层优化结果），analyses.json 与终端输出完全一致。3 天窗口已排除（RR 跌到 0.4），1H 已排除（噪声 6 倍）。最终：4H 收盘蜡烛 + [-32:] 窗口 |
 
 ### 7.7 共振评分公式（`resonance` 如何决定做空/做多）
 
@@ -411,6 +465,28 @@ ETH: 4H=空(-16)   1H=多(+2)    ⚡
 **结论**：4H MACD 保持不变。对应持有周期（6h-72h 复盘窗口），滤掉日内噪声。
 
 ### 7.10 教训系统现状（2026-06-20 更新）
+
+- `process_reviews.py` 有 `extract_lessons()` 函数和 `save_lessons_regime_aware()` 写入
+- `lessons.json` + `regimes/{regime}_lessons.json` 双轨存储
+- **2026-06-22 修复（#13）**：重建 `lessons.json` 时过滤空条目（`len(lesson.strip()) ≤ 10`）
+- **2026-06-22 修复（#9）**：`levels_score` 新增 -1 分支（支撑全部失效），"价位误判" 教训可生成
+- 轻量闭环：`inject_lessons.py`（cron :05）刷新 `.lesson_context.txt`
+
+### 7.11 方向判定 5 处同步 + SL/TP 统一（🆕 2026-06-22 全审计）
+
+**方向判定必须在 5 个位置保持阈值一致**，修改任一处即需同步其余 4 处：
+
+| # | 文件 | 函数/位置 | 变量名 |
+|---|------|-----------|--------|
+| 1 | `analysis_template.py` | `_format_coin_section` | `pos_dir` |
+| 2 | `_social_publish.py` | `analyze_single_coin` wrapper | `position_raw` |
+| 3 | `analysis_template.py` | `main()` JSON builder | `position` |
+| 4 | `analysis_template.py` | SL/TP fallback | `_pos_quick` |
+| 5 | `_social_publish.py` | `extract_direction()` | 返回值 |
+
+**SL/TP 已统一为单一实现**：模块级函数 `calc_sl_tp()`（`_social_publish.py`），被 `generate_social_draft()` 和 `publish_social.py` 共同调用（三方同源，消除 67 行重复代码），草案与 `social_analyses.json` 的 SL/TP 值完全一致。
+
+**patch 工具陷阱**：修改含 raw string 的正则时（如 `rf'...\d...'`），patch 可能双重转义 `\\d` → `\\\\d`，导致正则匹配字面 `\d` 而非数字。修改后必须用 `import re; re.search(...)` 验证。
 
 - `process_reviews.py` 有 `extract_lessons()` 函数和 `save_lessons_regime_aware()` 写入
 - `lessons.json` + `regimes/{regime}_lessons.json` 双轨存储

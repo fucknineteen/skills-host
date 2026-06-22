@@ -35,6 +35,8 @@ def fetch(conn, coin, tf, n):
         "SELECT ts, open, high, low, close, volume FROM klines WHERE coin=? AND timeframe=? ORDER BY ts DESC LIMIT ?",
         (coin, tf, n)
     ).fetchall()
+    if not rows:
+        return [], np.array([]), np.array([]), np.array([]), np.array([]), np.array([])
     rows.reverse()
     dates = [datetime.fromtimestamp(r[0]/1000, BJT) for r in rows]
     o = np.array([r[1] for r in rows], dtype=float)

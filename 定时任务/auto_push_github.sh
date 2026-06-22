@@ -50,7 +50,7 @@ for f in publish_social.py verify_social_post.py _social_publish.py; do
 done
 
 # 社交动态发布 scripts (in trade_review/scripts/)
-for f in gen_charts.py save_social_post.py review_last_post.py; do
+for f in gen_charts.py save_social_post.py review_last_post.py audit_draft.py; do
     if [ -f "$TRADE_REVIEW/scripts/$f" ]; then
         safe_copy "$TRADE_REVIEW/scripts/$f" "$MIRROR/社交/社交动态发布/scripts/$f"
     fi

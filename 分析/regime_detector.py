@@ -8,17 +8,19 @@ Usage:
   python3 regime_detector.py --verbose    # full diagnostic output
 
 Dimensions (backtest-optimized weights, sum=100%):
-  1. Price Structure  (8%)  — 30-day path, recovery %, HH/HL pattern
-  2. MA Dynamics     (14%)  — EMA(100) primary, EMA(200) slope context
-  3. Synthetic FG     (4%)  — price-derived fear/greed (low discrimination)
-  4. RSI Path        (12%)  — current RSI, recent extremes, recovery
-  5. Volume Pattern  (12%)  — V-reversal vol, recovery vs decline vol
-  6. ETH/BTC Ratio    (4%)  — ratio trend, structural baseline
-  7. Path Narrative   (5%)  — qualitative pattern recognition
-  8. MACD+ADX        (28%)  — histogram contraction + ADX trend (MOST DISCRIMINATIVE)
-  9. 4H Structure     (3%)  — HH/HL/LH/LL pattern
- 10. Historical       (3%)  — 8-dim feature vector (low info content)
- 11. Order Flow       (7%)  — funding rate + taker buy/sell ratio
+  1. Price Structure    (8%)  — 30-day path, recovery %, HH/HL pattern
+  2. MA Dynamics       (16%)  — EMA(100) primary, EMA(200) slope context
+  3. Synthetic FG       (2%)  — price-derived fear/greed (low discrimination)
+  4. RSI Path          (12%)  — current RSI, recent extremes, recovery
+  5. Volume Pattern    (12%)  — V-reversal vol, recovery vs decline vol
+  6. ETH/BTC Ratio      (4%)  — ratio trend, structural baseline
+  7. Path Narrative     (0%)  — qualitative pattern recognition (informational)
+  8. MACD+ADX/Momentum (22%)  — histogram contraction + ADX trend (MOST DISCRIMINATIVE)
+  9. 4H Structure       (4%)  — HH/HL/LH/LL pattern
+ 10. Historical         (2%)  — 8-dim feature vector (low info content)
+ 11. Order Flow         (7%)  — funding rate + taker buy/sell ratio
+ 12. Macro External     (8%)  — FRED data, DXY, VIX, BTC.D, 10Y
+ 13. Candlestick        (3%)  — TA-Lib 18 candlestick patterns
 """
 import sqlite3
 import json
@@ -26,13 +28,12 @@ import os
 import sys
 import urllib.request
 from datetime import datetime, timezone, timedelta
-from _shared import BJT as BJ
-from math import sqrt
+from _shared import BJT as BJ, DB_PATH
 from statistics import mean, stdev
 import talib
 import numpy as np
+import time as _time
 
-DB_PATH = '/root/.hermes/trade_review/okx_klines.db'
 REGIME_INDEX_PATH = '/root/.hermes/trade_review/regimes/regime_index.json'
 
 # Massive (Polygon.io) cross-verification
@@ -52,7 +53,7 @@ def fetch_daily(coin, days=90):
     """Fetch daily OHLCV for a coin, newest first."""
     db = sqlite3.connect(DB_PATH)
     rows = db.execute(
-        "SELECT close, high, low, volume, ts FROM klines "
+        "SELECT close, high, low, volume, ts, open FROM klines "
         "WHERE coin=? AND timeframe='1D' ORDER BY ts DESC LIMIT ?",
         (coin, days)
     ).fetchall()
@@ -352,8 +353,7 @@ def _get_recent_real_fg():
         recent_fgs = []
         for a in analyses[-20:]:  # last 20 records
             ts_str = a.get('timestamp', '')
-            macro = a.get('analysis', {}).get('macro', {})
-            fg = macro.get('fear_greed')
+            fg = a.get('macro_external', {}).get('fg_actual')
             if fg is not None and ts_str:
                 try:
                     dt = datetime.fromisoformat(ts_str)
@@ -362,8 +362,13 @@ def _get_recent_real_fg():
                 except (ValueError, TypeError):
                     pass
             # Also check coin-level FG
+            # NOTE: Coin-level FG lacks a timestamp field, so we cannot
+            # guarantee recency. Stale coin data may pollute the average.
+            # TODO: request coin FG with per-coin timestamp to prevent stale pollution.
+            # ⚠️ DEPRECATED: Consider removing coin-level FG from this check
+            # once all coins have timestamped FG in macro_external.
             for coin_data in a.get('analysis', {}).get('coins', {}).values():
-                coin_fg = coin_data.get('macro', {}).get('fear_greed')
+                coin_fg = coin_data.get('macro_external', {}).get('fg_actual')
                 if coin_fg is not None:
                     recent_fgs.append(coin_fg)
         if recent_fgs:
@@ -386,7 +391,6 @@ def score_synthetic_fg(btc_rows):
     
     current = closes[0]
     high_30d = max(highs)
-    low_30d = min(highs[0] for _ in [0])  # dummy
     low_30d_actual = min(r[2] for r in btc_rows[:30])
     
     # Component 1: Distance from 30-day high (0 at high, 100 at low → invert for FG)
@@ -483,6 +487,11 @@ def score_rsi_path(btc_rows):
         details.append(f"RSI={rsi:.0f} extreme-oversold")
     
     # 4b: RSI recovery (did it come from extremes?)
+    # NOTE: score -= 5 (bearish) is intentional here — in a bull-market
+    # correction context (the primary regime), bouncing from oversold
+    # levels signals the correction may be ending (bearish for correction,
+    # implicitly bullish for trend resumption). The overall regime weight
+    # handles the net effect.
     if rsi_7d_ago and rsi_14d_ago:
         if rsi_7d_ago < 25 and rsi > 40:
             score -= 5  # came from extreme oversold → bull_correction V-reversal context
@@ -603,16 +612,19 @@ def score_eth_btc(ratio_rows):
     
     # v2.3: Structural baseline check
     # If ETH/BTC has been declining at this rate for months, it's structural
-    db = sqlite3.connect(DB_PATH)
-    rows_90d = db.execute("""
-        SELECT a.close / b.close as ratio
-        FROM klines a
-        JOIN klines b ON a.ts = b.ts
-        WHERE a.coin='ETH' AND a.timeframe='1D'
-          AND b.coin='BTC' AND b.timeframe='1D'
-        ORDER BY a.ts DESC LIMIT 90
-    """).fetchall()
-    db.close()
+    rows_90d = []
+    try:
+        with sqlite3.connect(DB_PATH) as db:
+            rows_90d = db.execute("""
+                SELECT a.close / b.close as ratio
+                FROM klines a
+                JOIN klines b ON a.ts = b.ts
+                WHERE a.coin='ETH' AND a.timeframe='1D'
+                  AND b.coin='BTC' AND b.timeframe='1D'
+                ORDER BY a.ts DESC LIMIT 90
+            """).fetchall()
+    except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
+        rows_90d = []
     
     if len(rows_90d) >= 60:
         ratios_90d = [r[0] for r in rows_90d]
@@ -686,8 +698,8 @@ def score_path_narrative(btc_rows):
     score = 0
     
     # Pattern detection
-    drawdown = (high_30d - low_30d) / high_30d * 100
-    recovery = (current - second_half_low) / (high_30d - second_half_low) * 100 if high_30d != second_half_low else 50
+    drawdown = (high_30d - low_30d) / high_30d * 100 if high_30d != 0 else 0
+    recovery = min(100, (current - second_half_low) / (high_30d - second_half_low) * 100) if high_30d != second_half_low else 50
     
     if drawdown > 15 and recovery > 50:
         # Deep drop + strong recovery = classic V-shape (bull correction)
@@ -722,10 +734,12 @@ def score_path_narrative(btc_rows):
 
 def calc_macd_full(closes, fast=12, slow=75, signal=9):
     """Calculate MACD + histogram + 5-day & 10-day trends. Newest first.
-    v2.3: Also returns hist_10d for acceleration calculation."""
+    v2.3: Also returns hist_10d for acceleration calculation.
+    v2.8: Fixed double data-order bug — ema() expects newest-first, so
+    keep closes in newest-first order and don't reverse macd_vals."""
     if len(closes) < slow + signal + 11:
         return None, None, None, None, None
-    ordered = list(reversed(closes[:slow + signal + 11]))
+    ordered = closes[:slow + signal + 11]  # keep newest-first for ema()
     macd_vals = []
     for i in range(len(ordered) - slow + 1):
         f = ema(ordered[i:], fast)
@@ -734,7 +748,7 @@ def calc_macd_full(closes, fast=12, slow=75, signal=9):
             macd_vals.append(f - s)
     if len(macd_vals) < signal + 3:
         return None, None, None, None, None
-    macd_recent = list(reversed(macd_vals))
+    macd_recent = macd_vals  # already newest-first
     signal_now = ema(macd_recent, signal)
     if signal_now is None:
         return None, None, None, None, None
@@ -862,13 +876,23 @@ def score_momentum(btc_rows):
             acceleration = hist_change - hist_change_prev  # 2nd derivative
             
             if contracting:
-                # Contraction accelerating = reversal picking up steam
-                if acceleration < -2:  # contraction getting faster (more negative change)
-                    score += 10
-                    details[-1] += " accel↑"
-                elif acceleration > 2:  # contraction decelerating
-                    score -= 5
-                    details[-1] += " accel↓"
+                # Contraction acceleration: direction-aware scoring
+                if hist_now > 0:
+                    # Bullish hist declining — accelerating decline = more bearish
+                    if acceleration < -2:
+                        score -= 10
+                        details[-1] += " accel↓"
+                    elif acceleration > 2:
+                        score += 5
+                        details[-1] += " accel↑"
+                else:
+                    # Bearish hist rising — accelerating rise = more bullish
+                    if acceleration < -2:
+                        score += 10
+                        details[-1] += " accel↑"
+                    elif acceleration > 2:
+                        score -= 5
+                        details[-1] += " accel↓"
             elif expanding:
                 # Expansion accelerating = trend strengthening
                 if abs(acceleration) > 3:
@@ -1019,7 +1043,8 @@ def score_4h_structure(rows_4h):
 
 # Cache: avoid re-scanning DB on every call
 _history_cache = None  # stores (current_features_hash, top3_matches)
-_orderflow_cache = None  # v2.3: cache API results
+_history_data_cache = None  # stores (cache_time, all_feats, all_meta, mins, maxs, ranges)
+_orderflow_cache = None  # v2.3: cache API results, format: (timestamp, data, ttl_seconds)
 
 def _extract_window_features(closes, highs, lows):
     """8-dim feature vector for a 30-day window. Data is newest-first."""
@@ -1066,31 +1091,45 @@ def _scan_history(current_features):
     if _history_cache is not None and _history_cache[0] == feat_key:
         return _history_cache[1]
     
-    # Load all rows once
-    db = sqlite3.connect(DB_PATH)
-    all_rows = db.execute(
-        "SELECT close, high, low, ts FROM klines WHERE coin='BTC' AND timeframe='1D' ORDER BY ts ASC"
-    ).fetchall()
-    db.close()
+    global _history_data_cache
+
+    # Check data cache: reuse pre-computed features if fresh (< 1 hour)
+    _now = _time.time()
+    if _history_data_cache is not None:
+        data_time, all_feats, all_meta, mins, maxs, ranges = _history_data_cache
+        if _now - data_time < 3600:
+            n_dims = len(current_features)
+        else:
+            _history_data_cache = None
     
-    # Extract all feature vectors first for normalization
-    all_feats = []
-    all_meta = []
-    for start in range(len(all_rows) - 60):
-        wc = [r[0] for r in all_rows[start:start+30]]
-        wh = [r[1] for r in all_rows[start:start+30]]
-        wl = [r[2] for r in all_rows[start:start+30]]
-        feat = _extract_window_features(wc, wh, wl)
-        fwd_30d = (all_rows[start+59][0] - all_rows[start+29][0]) / all_rows[start+29][0] * 100
-        end_ts = all_rows[start+29][3]
-        all_feats.append(feat)
-        all_meta.append((end_ts, fwd_30d))
-    
-    # Min-max normalize each feature dimension
-    n_dims = len(current_features)
-    mins = [min(f[i] for f in all_feats) for i in range(n_dims)]
-    maxs = [max(f[i] for f in all_feats) for i in range(n_dims)]
-    ranges = [maxs[i] - mins[i] if maxs[i] != mins[i] else 1 for i in range(n_dims)]
+    if _history_data_cache is None:
+        # Load all rows once
+        db = sqlite3.connect(DB_PATH)
+        all_rows = db.execute(
+            "SELECT close, high, low, ts FROM klines WHERE coin='BTC' AND timeframe='1D' ORDER BY ts ASC"
+        ).fetchall()
+        db.close()
+        
+        # Extract all feature vectors first for normalization
+        all_feats = []
+        all_meta = []
+        for start in range(len(all_rows) - 60):
+            wc = [r[0] for r in reversed(all_rows[start:start+30])]
+            wh = [r[1] for r in reversed(all_rows[start:start+30])]
+            wl = [r[2] for r in reversed(all_rows[start:start+30])]
+            feat = _extract_window_features(wc, wh, wl)
+            fwd_30d = (all_rows[start+59][0] - all_rows[start+29][0]) / all_rows[start+29][0] * 100
+            end_ts = all_rows[start+29][3]
+            all_feats.append(feat)
+            all_meta.append((end_ts, fwd_30d))
+        
+        # Min-max normalize each feature dimension
+        n_dims = len(current_features)
+        mins = [min(f[i] for f in all_feats) for i in range(n_dims)]
+        maxs = [max(f[i] for f in all_feats) for i in range(n_dims)]
+        ranges = [maxs[i] - mins[i] if maxs[i] != mins[i] else 1 for i in range(n_dims)]
+        
+        _history_data_cache = (_now, all_feats, all_meta, mins, maxs, ranges)
     
     # Normalize current features
     current_norm = [(current_features[i] - mins[i]) / ranges[i] for i in range(n_dims)]
@@ -1241,13 +1280,12 @@ def fetch_orderflow():
     v2.3: Caches results for 5 minutes to avoid repeated API calls.
     """
     global _orderflow_cache
-    import time as _time
-    
-    # Check cache: 5-minute TTL
+
+    # Check cache: TTL varies (300s success, 30s error)
     now = _time.time()
     if _orderflow_cache is not None:
-        cache_time, cached_data = _orderflow_cache
-        if now - cache_time < 300:  # 5 minutes
+        cache_time, cached_data, cache_ttl = _orderflow_cache
+        if now - cache_time < cache_ttl:
             return cached_data
     try:
         # Current funding rate
@@ -1281,11 +1319,11 @@ def fetch_orderflow():
                 taker_ratios.append(buy_vol / sell_vol)
         
         result = (current_fr, fr_history, taker_ratios, None)
-        _orderflow_cache = (now, result)
+        _orderflow_cache = (now, result, 300)
         return result
     except Exception as e:
         error_result = (0.0, [], [], str(e)[:80])
-        _orderflow_cache = (now, error_result)
+        _orderflow_cache = (now, error_result, 30)
         return error_result
 
 
@@ -1422,15 +1460,16 @@ def fetch_fred_data():
     Cached for 24 hours (monthly data, no benefit from frequent polling).
     """
     global _fred_cache
-    import time as _time
-    
+
     now = _time.time()
     if _fred_cache is not None:
         cache_time, cached_result = _fred_cache
         if now - cache_time < 86400:  # 24 hours
             return cached_result
     
-    FRED_KEY = 'cb9b7745e36033299d8d266d87308bfb'
+    FRED_KEY = os.environ.get('FRED_API_KEY', '')
+    if not FRED_KEY:
+        return {'ffr': None, 'unemployment': None, 'spread_10y2y': None, 'cpi': None}
     series = {
         'DFF': 'ffr',
         'UNRATE': 'unemployment',
@@ -1463,10 +1502,9 @@ def fetch_fred_data():
 
 def _yahoo_close(symbol, range_d='5d', timeout=8):
     """Fetch latest close price from Yahoo Finance chart API."""
-    import urllib.request, json as _json
     url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range={range_d}'
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    data = _json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+    data = json.loads(urllib.request.urlopen(req, timeout=timeout).read())
     closes = data['chart']['result'][0]['indicators']['quote'][0]['close']
     closes = [c for c in closes if c is not None]
     if not closes:
@@ -1482,8 +1520,7 @@ def fetch_macro_external():
     v2.9: Added VIX + 10Y Treasury yield (Yahoo Finance).
     """
     global _macro_cache
-    import time as _time
-    
+
     now = _time.time()
     if _macro_cache is not None:
         cache_time, cached_result = _macro_cache
@@ -1525,7 +1562,13 @@ def fetch_macro_external():
         vix, vix_change = _yahoo_close('%5EVIX')  # ^VIX
         
         # 5. 10Y US Treasury Yield (Yahoo Finance, ^TNX)
-        yield10, yield10_change = _yahoo_close('%5ETNX')  # ^TNX
+        yield10, yield10_change_pct = _yahoo_close('%5ETNX')  # ^TNX
+        # Convert percentage change to basis points (e.g., 4.00%→4.20% is +20bp, not +5%)
+        if yield10 is not None and yield10_change_pct != 0:
+            yield10_old = yield10 / (1 + yield10_change_pct / 100)
+            yield10_change = (yield10 - yield10_old) * 100  # basis points
+        else:
+            yield10_change = 0
         
         # 6. FRED macro data (Fed Funds Rate, Unemployment, 10Y-2Y spread, CPI)
         fred = fetch_fred_data()
@@ -1783,14 +1826,9 @@ def score_candlestick_patterns(btc_rows):
     - Each candle can trigger multiple patterns → stronger signal
     """
     closes = np.array([r[0] for r in btc_rows[:10]], dtype=np.float64)
-    opens  = np.array([r[0] for r in btc_rows[:10]], dtype=np.float64)  # approximate
     highs  = np.array([r[1] for r in btc_rows[:10]], dtype=np.float64)
     lows   = np.array([r[2] for r in btc_rows[:10]], dtype=np.float64)
-    
-    # We don't have real open prices from DB (only close/high/low/volume)
-    # Approximate: use previous close as open
-    opens = np.roll(closes, 1)
-    opens[0] = closes[0] * 0.999  # rough approximation for today
+    opens  = np.array([r[5] for r in btc_rows[:10]], dtype=np.float64)
     
     details = []
     score = 0
@@ -1800,6 +1838,9 @@ def score_candlestick_patterns(btc_rows):
     recency_weights = [3, 2, 1, 1, 1]
     
     # Key reversal patterns to detect
+    # NOTE: CDLHARAMI is a single TA-Lib function that returns positive
+    # for bullish harami and negative for bearish harami. Direction is
+    # derived from candle_val sign at runtime — see below.
     patterns = {
         # Bullish reversal
         'CDLHAMMER':         ('hammer', 15),
@@ -1808,13 +1849,12 @@ def score_candlestick_patterns(btc_rows):
         'CDLMORNINGDOJISTAR':('morning-doji-star', 25),
         'CDLENGULFING':      ('bull-engulf', 20),
         'CDLPIERCING':       ('piercing', 15),
-        'CDLHARAMI':         ('bull-harami', 10),
+        'CDLHARAMI':         ('harami', 10),
         'CDL3WHITESOLDIERS': ('3-white-soldiers', 30),
         # Bearish reversal
         'CDLSHOOTINGSTAR':   ('shooting-star', -15),
         'CDLEVENINGSTAR':    ('evening-star', -20),
         'CDLEVENINGDOJISTAR':('evening-doji-star', -25),
-        'CDLHARAMI':         ('bear-harami', -10),
         'CDLDARKCLOUDCOVER': ('dark-cloud', -15),
         'CDL3BLACKCROWS':    ('3-black-crows', -30),
         'CDLHANGINGMAN':     ('hanging-man', -15),
@@ -1829,10 +1869,10 @@ def score_candlestick_patterns(btc_rows):
     for i in range(min(5, len(closes) - 3)):
         # Slice for this candle (need context candles before/after)
         idx = i
-        o = opens[idx:idx+5] if idx+5 <= len(opens) else opens[idx:]
-        h = highs[idx:idx+5] if idx+5 <= len(highs) else highs[idx:]
-        l = lows[idx:idx+5] if idx+5 <= len(lows) else lows[idx:]
-        c = closes[idx:idx+5] if idx+5 <= len(closes) else closes[idx:]
+        o = opens[idx:idx+5][::-1] if idx+5 <= len(opens) else opens[idx:][::-1]
+        h = highs[idx:idx+5][::-1] if idx+5 <= len(highs) else highs[idx:][::-1]
+        l = lows[idx:idx+5][::-1] if idx+5 <= len(lows) else lows[idx:][::-1]
+        c = closes[idx:idx+5][::-1] if idx+5 <= len(closes) else closes[idx:][::-1]
         
         if len(o) < 3:
             continue
@@ -1848,10 +1888,17 @@ def score_candlestick_patterns(btc_rows):
                 candle_val = result[-1] if len(result) >= 1 else 0
                 if candle_val != 0:
                     w = recency_weights[min(i, len(recency_weights)-1)]
-                    # Bullish pattern on bearish candle is stronger (reversal context)
-                    is_bullish = point_val > 0
-                    score += point_val * w
-                    found_patterns.append(f"{label}{'+' if is_bullish else ''}(d-{i})" if point_val != 0 else f"{label}(d-{i})")
+                    # Harami direction comes from TA-Lib result sign,
+                    # not from the static point_val (which is just magnitude)
+                    if func_name == 'CDLHARAMI':
+                        is_bullish = candle_val > 0
+                        direction = 1 if is_bullish else -1
+                        score += abs(point_val) * direction * w
+                        found_patterns.append(f"{'bull-' if is_bullish else 'bear-'}{label}(d-{i})")
+                    else:
+                        is_bullish = point_val > 0
+                        score += point_val * w
+                        found_patterns.append(f"{label}{'+' if is_bullish else ''}(d-{i})" if point_val != 0 else f"{label}(d-{i})")
             except Exception:
                 pass
     
@@ -1898,6 +1945,12 @@ def detect_regime(verbose=False):
     
     score2, detail2 = score_ma_dynamics(btc_rows)
     dims['ma_dynamics'] = {'score': score2, 'detail': detail2, 'weight': 16}
+    # Include EMA200 for transition warning display
+    closes_200 = [r[0] for r in btc_rows[:200]]
+    if len(closes_200) >= 200:
+        e200 = ema(closes_200, 200)
+        if e200:
+            dims['ma_dynamics']['ma200'] = round(e200)
     
     score3, detail3, fg = score_synthetic_fg(btc_rows)
     dims['synthetic_fg'] = {'score': score3, 'detail': detail3, 'weight': 2, 'fg_proxy': fg}
@@ -1912,7 +1965,7 @@ def detect_regime(verbose=False):
     dims['eth_btc'] = {'score': score6, 'detail': detail6, 'weight': 4}
     
     score7, detail7 = score_path_narrative(btc_rows)
-    dims['path_narrative'] = {'score': score7, 'detail': detail7, 'weight': 0}  # removed weight
+    dims['path_narrative'] = {'score': score7, 'detail': detail7, 'weight': 0}  # DEAD: weight=0
     
     score8, detail8, mom_data = score_momentum(btc_rows)
     dims['momentum'] = {'score': score8, 'detail': detail8, 'weight': 22}
@@ -1971,7 +2024,7 @@ def detect_regime(verbose=False):
         # Use 7d high as more realistic bull trigger than 30d high
         bull_trigger = max(high_7d, current_price * 1.03)
         warnings.append(f"If price breaks above {bull_trigger:.0f} (7d high or +3%) with volume → 牛市主升")
-        if dims['synthetic_fg']['fg_proxy'] < 15:
+        if dims.get('synthetic_fg', {}).get('fg_proxy', 100) is not None and dims['synthetic_fg']['fg_proxy'] < 15:
             warnings.append("Extreme fear proxy: V-reversal risk high, avoid bearish bets")
         if dims['rsi_path'].get('rsi', 50) < 25:
             warnings.append("RSI extreme oversold: bounce probability elevated")
@@ -2025,10 +2078,10 @@ def _score_to_regime(total_score, dims):
     Added transition zone for ambiguous composites.
     Uses dimension scores as tie-breakers.
     """
-    ps = dims['price_structure']['score']
-    ma = dims['ma_dynamics']['score']
-    vol = dims['volume']['score']
-    narr = dims['path_narrative']['score']
+    ps = dims.get('price_structure', {}).get('score', 0)
+    ma = dims.get('ma_dynamics', {}).get('score', 0)
+    vol = dims.get('volume', {}).get('score', 0)
+    narr = dims.get('path_narrative', {}).get('score', 0)
     mom = dims.get('momentum', {}).get('score', 0)
     h4 = dims.get('4h_structure', {}).get('score', 0)
     of_score = dims.get('order_flow', {}).get('score', 0)
@@ -2050,7 +2103,7 @@ def _score_to_regime(total_score, dims):
         # Transition zone — direction pending
         # v2.6: macro_ext and eth score included in voting
         bullish_votes = sum(1 for d in [ps, ma, vol, mom, of_score, macro] if d > 5)
-        bearish_votes = sum(1 for d in [ps, ma, eth, narr, macro] if d < -5)
+        bearish_votes = sum(1 for d in [ps, ma, eth, narr, macro, h4] if d < -5)
         if bullish_votes >= 3 and bearish_votes <= 1:
             regime, base_conf = '牛市回调', int(35 + abs(total_score) * 1.5)
         elif bearish_votes >= 3 and bullish_votes <= 1:
@@ -2120,7 +2173,10 @@ def _score_to_regime(total_score, dims):
         present = [d for d in key_dims if d in dims]
         if present:
             # Check if key dimensions agree with regime direction
-            regime_polarity = 1 if regime in ('牛市主升', '牛市回调', '熊市反弹') else -1
+            if regime == '横盘震荡':
+                regime_polarity = 0
+            else:
+                regime_polarity = 1 if regime in ('牛市主升', '牛市回调', '熊市反弹') else -1
             agreement = 0
             for d in present:
                 dim_score = dims[d]['score']
@@ -2162,7 +2218,8 @@ def check_event_overlay():
     
     for event in known_events:
         try:
-            event_dt = datetime.strptime(f"{event['date']} {event['time']}", '%Y-%m-%d %H:%M')
+            event_str = f"{event.get('date', '')} {event.get('time', '')}"
+            event_dt = datetime.strptime(event_str, '%Y-%m-%d %H:%M')
             event_dt = event_dt.replace(tzinfo=BJ)
         except (ValueError, KeyError):
             continue
@@ -2171,9 +2228,9 @@ def check_event_overlay():
         hours_since = (now - event_dt).total_seconds() / 3600
         
         if 0 <= hours_to <= 48:
-            return {'overlay': '事件驱动', 'event': event['name'], 'status': 'pre', 'hours_until': round(hours_to, 1)}
+            return {'overlay': '事件驱动', 'event': event.get('name', 'unknown'), 'status': 'pre', 'hours_until': round(hours_to, 1)}
         if 0 <= hours_since <= 12:
-            return {'overlay': '事件驱动', 'event': event['name'], 'status': 'post', 'hours_since': round(hours_since, 1)}
+            return {'overlay': '事件驱动', 'event': event.get('name', 'unknown'), 'status': 'post', 'hours_since': round(hours_since, 1)}
     
     return None
 
@@ -2219,14 +2276,14 @@ def update_regime_index(result):
     if result['confidence'] >= 60:
         new_entry = {
             'regime': result['regime'],
-            'overlay': result['overlay']['overlay'] if result['overlay'] else None,
+            'overlay': result['overlay'].get('overlay') if result['overlay'] else None,
             'start_date': datetime.now(BJ).strftime('%Y-%m-%d'),
             'end_date': None,
             'status': 'active',
             'confidence': result['confidence'],
             'composite_score': result['composite_score'],
-            'description': f"Composite={result['composite_score']}, 7-dim weighted score",
-            'entry_conditions': result['indicators'],
+            'description': f"Composite={result['composite_score']}, 13-dim weighted score",
+            'entry_conditions': result['indicators'],  # 注: 字段名为entry_conditions但存储的是indicators数据
             'lesson_count': 0,
             'core_lessons': [],
             'transition_watch': result['transition_warnings']

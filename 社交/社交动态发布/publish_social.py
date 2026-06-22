@@ -268,12 +268,6 @@ def main():
         print(f'  DB_PATH={DB_PATH}')
         sys.exit(1)
     analyses = []
-    # 预拉取日历事件（多币种共享，避免 per-coin 重复调用）
-    try:
-        from _social_publish import get_jin10_key_events as _get_cal
-        _shared_cal = _get_cal()
-    except Exception:
-        _shared_cal = None
     for i, coin in enumerate(coins):
         tres = [None]; fres = [None]
         def _ft(): tres[0] = fetch_okx_ticker(f'{coin}USDT')
@@ -286,7 +280,7 @@ def main():
             print(f'  ⚠️ {coin}: ticker fetch failed, skipping')
             continue
         try:
-            a = analyze_single_coin(conn, coin, tres[0], fres[0], fg_val, fg_label, flash_news=_shared_flash, calendar_events=_shared_cal)
+            a = analyze_single_coin(conn, coin, tres[0], fres[0], fg_val, fg_label, flash_news=_shared_flash)
             analyses.append(a)
             print(f'  ✅ {coin}: {a["ticker"].get("last", "?")}, resonance={a["resonance"]}')
         except Exception as e:
@@ -368,8 +362,6 @@ def main():
                     'funding_rate_pct': funding_rate_pct,  # 可核验的费率字段
                     'indicators': a['indicators'],
                     'levels_4h': a['levels_4h'],
-                    'near_support': a.get('near_support', []),  # FIX: 写入 near_support/near_resistance 供 generate_social_draft 使用
-                    'near_resistance': a.get('near_resistance', []),
                     'resonance': a['resonance'],
                     'position': a.get('position', '观望'),
                     'rsi_4h': a['rsi_4h'],
