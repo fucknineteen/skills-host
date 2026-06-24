@@ -6,6 +6,7 @@
 import os, sys, json, re, subprocess, time
 from datetime import datetime
 from _shared import BJT, TRADE_DIR, _retry
+from sltp_engine import decision_engine
 
 # ── 共享常量 ──────────────────────────────────────────────
 _DB = os.path.join(TRADE_DIR, 'okx_klines.db')
@@ -18,13 +19,11 @@ from analysis_template import (
     # 指标计算
     is_closed, calc_rsi, calc_macd, calc_adx, calc_bollinger, calc_obv,
     # K线 / 趋势 / 风控
-    candle_body_label, trend_direction, check_acceleration,
+    candle_body_label, trend_direction, detect_v_reversal,
     # 数据库查询
     get_rows, build_data_freshness,
     # 主分析函数
     analyze_single_coin as _base_analyze,
-    # 常量
-    MACD_PARAMS, TIMEFRAMES,
 )
 
 # ── 恐惧贪婪 ──────────────────────────────────────────────
@@ -163,38 +162,112 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label, flash_new
     trend_1d = result['indicators']['1D'].get('trend', '')
     macd_h_4h = result.get('macd_h_4h')
     near_bottom = result.get('near_bottom', False)
-    
-    # 方向判定 — 共振 + near_bottom/near_top + MACD/RSI 为辅 (与 _format_coin_section 对齐)
-    # FIX BUG#1: near_bottom+偏弱共振+favorable MACD/RSI 应 → 偏多（在第一优先级检查，不会被V反降级）
     rsi_1h_val = result.get('rsi_1h', 50)
-    if '强' in str(resonance) or (near_bottom and macd_h_4h is not None and macd_h_4h > -50 and rsi_1h_val is not None and rsi_1h_val < 45):
+    
+    # ════════════════════════════════════════════════
+    # 方向判定 v062309 — 威科夫 + 缠论 + 道氏 + 共振
+    # ════════════════════════════════════════════════
+    trend_4h = result['indicators']['4H'].get('trend', '')
+    position_raw = None
+    
+    # 预计算威科夫（供 L0 使用，避免先读后写）
+    wk_data = result.get('wyckoff_data') or {}
+    if not wk_data and 'indicators' in result:
+        try:
+            wk_data = wyckoff_detect({
+                'coin': coin, 'close_status': result['close_status'],
+                'indicators': result['indicators'], 'levels_4h': result.get('levels_4h', {}),
+                'resonance': resonance, 'near_bottom': near_bottom,
+            }) or {}
+        except: pass
+    
+    # L0: 威科夫结构信号
+    wk_events = wk_data.get('events', [])
+    wk_conf = wk_data.get('confidence', 0)
+    ev_str = ' '.join(wk_events)
+    if any('Spring' in e for e in wk_events) and 'SOS' in ev_str and wk_conf >= 50:
         position_raw = '偏多'
-    elif '弱' in str(resonance) or (rsi_1d_val and rsi_1d_val > 65 and macd_h_4h is not None and macd_h_4h < -50):
-        position_raw = '偏空'
-    elif rsi_1d_val and rsi_1d_val > 67 and trend_1d in ('下降', '偏空') and macd_h_4h is not None and macd_h_4h < 0:
-        position_raw = '偏空'
-    elif near_bottom:
+    elif any('UTAD' in e for e in wk_events) and wk_conf >= 50:
+        vah_v = result.get('session_vp', {}).get('vah', 0)
+        if cp > 0 and vah_v > 0 and cp < vah_v:
+            position_raw = '偏空'
+    
+    # L0.5: 缠论买卖点
+    if position_raw is None:
+        closed_4h_cl = result.get('close_status', {}).get('4H', {}).get('closed', [])
+        if len(closed_4h_cl) >= 60:
+            try: from chanlun import analyze_chanlun
+            except: analyze_chanlun = None
+            if analyze_chanlun:
+                h4 = [r[2] for r in closed_4h_cl]; l4 = [r[3] for r in closed_4h_cl]; c4 = [r[4] for r in closed_4h_cl]
+                cl = analyze_chanlun(h4, l4, c4, cp)
+                if '一买' in cl['points']['buy'] or '二买' in cl['points']['buy']:
+                    position_raw = '偏多'
+                elif '一卖' in cl['points']['sell'] or '二卖' in cl['points']['sell']:
+                    position_raw = '偏空'
+    
+    # L1: 道氏多周期趋势
+    if trend_1d in ('上升',) and trend_4h in ('上升', '偏多'):
         position_raw = '偏多'
-    else:
-        position_raw = '观望（等确认）'
-
-    # L3: V反保护 — 底部区域/反弹中禁止做空 (与 _format_coin_section 对齐)
+    elif trend_1d in ('下降',) and trend_4h in ('下降', '偏空'):
+        position_raw = '偏空'
+    
+    # L2: 共振 + near_bottom
+    if position_raw is None:
+        if '强' in str(resonance) or (near_bottom and macd_h_4h is not None and macd_h_4h > -50 and rsi_1h_val is not None and rsi_1h_val < 45):
+            position_raw = '偏多'
+        elif '弱' in str(resonance) or (rsi_1d_val and rsi_1d_val > 65 and macd_h_4h is not None and macd_h_4h < -50):
+            position_raw = '偏空'
+        elif rsi_1d_val and rsi_1d_val > 67 and trend_1d in ('下降', '偏空') and macd_h_4h is not None and macd_h_4h < 0:
+            position_raw = '偏空'
+        elif near_bottom:
+            position_raw = '偏多'
+        else:
+            position_raw = '观望（等确认）'
+    
+    # V反保护
     if position_raw == '偏空':
         if near_bottom:
             position_raw = '观望（near_bottom保护）'
         else:
             closed_4h = result.get('close_status', {}).get('4H', {}).get('closed', [])
-            if closed_4h and len(closed_4h) >= 8:
-                lows_8 = [r[3] for r in closed_4h[-8:]]
-                min_low = min(lows_8)
-                _last_val = ticker.get('last', closed_4h[-1][4])
-                try:
-                    current = float(_last_val) if _last_val and _last_val != '?' else 0
-                except (ValueError, TypeError):
-                    current = 0
-                recovery_pct = (current - min_low) / min_low * 100 if min_low > 0 else 0
-                if recovery_pct > 3:
-                    position_raw = '观望（反弹{:.1f}%，V反保护）'.format(recovery_pct)
+            is_rev, rec_pct = detect_v_reversal(closed_4h, ticker.get('last'))
+            if is_rev:
+                position_raw = '观望（反弹{:.1f}%，V反保护）'.format(rec_pct)
+    # SL/TP v062309 — decision_engine 三层解耦
+    if position_raw in ('偏多', '偏空') and lows_near_sr and highs_near_sr:
+        direction = 'LONG' if position_raw == '偏多' else 'SHORT'
+        tp1_v = highs_near_sr[-1] if direction == 'LONG' else lows_near_sr[-1]
+        closed_4h_sltp = result.get('close_status', {}).get('4H', {}).get('closed', [])
+        if direction == 'LONG':
+            tp2_v = max(r[2] for r in closed_4h_sltp[-80:] if r[2] > cp) if closed_4h_sltp else None
+        else:
+            tp2_v = min(r[3] for r in closed_4h_sltp[-80:] if r[3] < cp) if closed_4h_sltp else None
+        svp = result.get('session_vp', {}); vah_v, val_v = svp.get('vah',0), svp.get('val',0)
+        tp3_v = max(vah_v, 0) if direction == 'LONG' else min(val_v, 0)
+        wk = result.get('wyckoff_data', {})
+        sw_lows_w = wk.get('swing_lows', []); sw_highs_w = wk.get('swing_highs', [])
+        sw_ls = sw_lows_w[-1] if sw_lows_w else None; sw_hs = sw_highs_w[-1] if sw_highs_w else None
+        trend_1d_v = result['indicators']['1D'].get('trend', '')
+        trend_4h_v = result['indicators']['4H'].get('trend', '')
+        l1_aligned = (trend_1d_v in ('上升',) and trend_4h_v in ('上升','偏多')) or (trend_1d_v in ('下降',) and trend_4h_v in ('下降','偏空'))
+        sig_lvl = 'L1' if l1_aligned else 'L2'
+        tp2_age = None
+        if tp2_v and closed_4h_sltp:
+            for r in reversed(closed_4h_sltp):
+                if abs(r[2] - tp2_v) < 1: tp2_age = (datetime.now(BJT) - datetime.fromtimestamp(r[0]/1000, BJT)).days if r[0] else None; break
+        plan = decision_engine(direction=direction, entry=cp, atr=atr_4h_sr,
+            near_support=lows_near_sr, near_resistance=highs_near_sr,
+            swing_low=sw_ls, swing_high=sw_hs, chanlun_zd=None,
+            tp1=tp1_v, tp2=tp2_v, tp3=tp3_v,
+            tp2_age_days=tp2_age, signal_level=sig_lvl, l1_aligned=l1_aligned)
+        if plan.risk_pct > 0:
+            result['sl_val'] = round(plan.sl, 1)
+            result['tp_val'] = round(plan.tp, 1)
+            result['rr_str'] = str(round(plan.rr, 2))
+        else:
+            position_raw = '观望（{}）'.format(plan.blocked_reason or 'SL/TP无效')
+            result['sl_val'] = 0; result['tp_val'] = 0; result['rr_str'] = '?'
     result['position'] = position_raw
     
     # 威科夫 / Volume Profile / 日历 / 宏观
@@ -204,7 +277,7 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label, flash_new
         'accel': result['accel'], 'near_bottom': near_bottom,
         'resonance': resonance, 'risks': result.get('risks', []),
     }
-    result['session_vp'] = session_vp(coin, conn) or {}
+    result['session_vp'] = session_vp(coin.replace('USDT', '') if coin.endswith('USDT') else coin, conn) or {}
     result['wyckoff_data'] = wyckoff_detect(result_dict) or {}
     # kline_patterns 已在 _base_analyze 中计算，不覆盖
     result['calendar_events'] = calendar_events if calendar_events is not None else get_jin10_key_events()
@@ -243,36 +316,34 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label, flash_new
 
 # ── 方向提取 ──────────────────────────────────────────────
 def extract_direction(coin_a):
-    """从分析结果提取交易方向简述（含near_bottom/V反保护）"""
+    """从分析结果提取交易方向简述（含near_bottom/V反保护）
+    对齐 wrapper analyze_single_coin 的 position 判定逻辑"""
     if not coin_a: return ''
     resonance = coin_a.get('resonance', '')
     rsi_4h = coin_a.get('rsi_4h', 50)
     macd_h = coin_a.get('macd_h_4h', 0)
     near_bottom = coin_a.get('near_bottom', False)
-    # V反检测（与 wrapper 中的 L3 对齐）
-    # BUGFIX: use live ticker price instead of stale kline close
-    closed_4h = (coin_a.get('close_status') or {}).get('4H', {}).get('closed', [])
-    v_reversal = False
-    if closed_4h and len(closed_4h) >= 8:
-        lows_8 = [r[3] for r in closed_4h[-8:]]
-        min_low = min(lows_8)
-        try:
-            current = float((coin_a.get('ticker') or {}).get('last', closed_4h[-1][4]))
-        except (TypeError, ValueError):
-            current = closed_4h[-1][4]
-        recovery_pct = (current - min_low) / min_low * 100 if min_low > 0 else 0
-        if recovery_pct > 3:
-            v_reversal = True
-    # near_bottom优先判断（对齐 wrapper position 判定 L170-179）
-    # FIX: 与主分析逻辑一致 — '强'共振即可做多（不要求 macd_h > 0）
-    #      near_bottom + favorable MACD/RSI → 偏多（不做空）
     rsi_1h_val = coin_a.get('rsi_1h', 50)
+    # rsi_1d — 对齐 wrapper L172-175 的偏空条件
+    rsi_1d = (coin_a.get('indicators', {}).get('1D', {}) or {}).get('rsi')
+    trend_1d = (coin_a.get('indicators', {}).get('1D', {}) or {}).get('trend', '')
+    
+    # V反检测（统一使用 detect_v_reversal，消除与 wrapper 的语义分歧）
+    closed_4h = (coin_a.get('close_status') or {}).get('4H', {}).get('closed', [])
+    v_reversal, _ = detect_v_reversal(closed_4h, (coin_a.get('ticker') or {}).get('last'))
+    
+    # near_bottom优先判断（对齐 wrapper position 判定 L170-179）
     if '强' in str(resonance) or (near_bottom and macd_h is not None and macd_h > -50 and rsi_1h_val is not None and rsi_1h_val < 45):
         return f"做多 RSI={rsi_4h:.0f} MACD={macd_h:.0f}"
-    elif near_bottom and macd_h is not None and macd_h > -50:
-        return f"观望（near_bottom）RSI={rsi_4h:.0f} MACD={macd_h:.0f}"
-    elif ('弱' in str(resonance) or macd_h is not None and macd_h < -50) and not near_bottom and not v_reversal:
-        return f"做空 RSI={rsi_4h:.0f}"
+    elif near_bottom:
+        return f"偏多（near_bottom）RSI={rsi_4h:.0f} MACD={macd_h:.0f}"
+    # 偏空条件对齐 wrapper: '弱'共振 or (rsi_1d>65 + macd_4h<-50) or (rsi_1d>67 + 下降趋势 + macd<0)
+    elif not near_bottom and not v_reversal:
+        is_weak_resonance = '弱' in str(resonance)
+        is_bearish_oversold = (rsi_1d is not None and rsi_1d > 65 and macd_h is not None and macd_h < -50)
+        is_bearish_trend = (rsi_1d is not None and rsi_1d > 67 and trend_1d in ('下降', '偏空') and macd_h is not None and macd_h < 0)
+        if is_weak_resonance or is_bearish_oversold or is_bearish_trend:
+            return f"做空 RSI={rsi_4h:.0f}"
     return '观望'
 
 # ── 恐惧贪婪简称 ──────────────────────────────────────────
@@ -289,6 +360,7 @@ def _fg_short(fg_val):
 def calc_sl_tp(entry, near_s, near_r, atr, pos_label):
     """方向感知 SL/TP 计算，ATR 缓冲。统一模块级实现。
     BUGFIX 5a: 当数据不足但方向非观望时，返回估算值而非(0,0,'?')以避免文案误判。
+    BUGFIX 5b: 方向感知选价 — 做空取最近阻力（min above entry），做多取最近支撑（max below entry）。
     """
     if not entry or entry <= 0:
         return 0, 0, '?'
@@ -309,11 +381,17 @@ def calc_sl_tp(entry, near_s, near_r, atr, pos_label):
         rr = abs(tp - entry) / abs(entry - sl)
         return sl, tp, f'{rr:.1f}' if rr > 0 else '?'
     if '空' in str(pos_label):
-        sl = round(near_r[0] + atr * 0.5)
-        tp = round(near_s[0])
+        # 做空：SL取最近阻力(最小值在上方)，TP取最近支撑(最大值在下方)
+        sl_r = min(r for r in near_r if r > entry) if any(r > entry for r in near_r) else near_r[0]
+        tp_s = max(s for s in near_s if s < entry) if any(s < entry for s in near_s) else near_s[0]
+        sl = round(sl_r + atr * 0.5)
+        tp = round(tp_s)
     else:
-        sl = round(near_s[0] - atr * 0.5)
-        tp = round(near_r[0])
+        # 做多：SL取最近支撑(最大值在下方)，TP取最近阻力(最小值在上方)
+        sl_s = max(s for s in near_s if s < entry) if any(s < entry for s in near_s) else near_s[0]
+        tp_r = min(r for r in near_r if r > entry) if any(r > entry for r in near_r) else near_r[0]
+        sl = round(sl_s - atr * 0.5)
+        tp = round(tp_r)
     if abs(entry - sl) <= 0:
         return sl, tp, '?'
     rr = abs(tp - entry) / abs(entry - sl)
@@ -353,16 +431,17 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
     eth_sl_val = eth.get('sl_val')
     eth_tp_val = eth.get('tp_val')
     eth_rr_str = eth.get('rr_str')
-    # 如果 near_support 缺失但有 sl_val/tp_val，用它们替代 L350-353 的生成
+    # 如果 near_support/near_resistance 缺失，显示 levels_4h 回退或 ?
+    # ⚠️ 禁止用 sl_val/tp_val 充当支撑阻力（止损≠支撑、止盈≠阻力）
     if not btc_near_s or not btc_near_r:
-        s_btc = f'{int(btc_sl_val)}' if btc_sl_val else '?'
-        r_btc = f'{int(btc_tp_val)}' if btc_tp_val else '?'
+        s_btc = '→'.join(f'{int(x)}' for x in btc_near_s[:2]) if btc_near_s else '?'
+        r_btc = '→'.join(f'{int(x)}' for x in btc_near_r[:2]) if btc_near_r else '?'
     else:
         s_btc = '→'.join(f'{int(x)}' for x in btc_near_s[:2])
         r_btc = '→'.join(f'{int(x)}' for x in btc_near_r[:2])
     if not eth_near_s or not eth_near_r:
-        s_eth = f'{int(eth_sl_val)}' if eth_sl_val else '?'
-        r_eth = f'{int(eth_tp_val)}' if eth_tp_val else '?'
+        s_eth = '→'.join(f'{int(x)}' for x in eth_near_s[:2]) if eth_near_s else '?'
+        r_eth = '→'.join(f'{int(x)}' for x in eth_near_r[:2]) if eth_near_r else '?'
     else:
         s_eth = '→'.join(f'{int(x)}' for x in eth_near_s[:2])
         r_eth = '→'.join(f'{int(x)}' for x in eth_near_r[:2])
@@ -373,7 +452,8 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
 
     btc_ind = btc.get('indicators', {})
     eth_ind = eth.get('indicators', {})
-    btc_vp = btc.get('session_vp', {}); eth_vp = eth.get('session_vp', {})
+    btc_vp = btc.get('session_vp') or btc.get('vp_data', {})  # 兼容旧键名 vp_data
+    eth_vp = eth.get('session_vp') or eth.get('vp_data', {})
     btc_poc = btc_vp.get('poc'); btc_vah = btc_vp.get('vah'); btc_val = btc_vp.get('val')
     eth_poc = eth_vp.get('poc'); eth_vah = eth_vp.get('vah'); eth_val = eth_vp.get('val')
     btc_wy = btc.get('wyckoff_data', {}); eth_wy = eth.get('wyckoff_data', {})
@@ -392,8 +472,16 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
     eth_dir_label = '偏多' if '多' in str(eth_pos) else ('偏空' if '空' in str(eth_pos) else '观望')
     btc_atr = btc_ind.get('4H', {}).get('atr', btc_pf * 0.02)
     eth_atr = eth_ind.get('4H', {}).get('atr', eth_pf * 0.02)
-    btc_sl_val, btc_tp_val, btc_rr_str = calc_sl_tp(btc_pf, btc_near_s, btc_near_r, btc_atr, btc_pos)
-    eth_sl_val, eth_tp_val, eth_rr_str = calc_sl_tp(eth_pf, eth_near_s, eth_near_r, eth_atr, eth_pos)
+    # 优先使用JSON中已有的sl_val/tp_val/rr_str（publish_social.py已计算），缺失时才重新计算
+    # 避免📍行(用JSON值)与🎯行(重新计算)数据源不一致
+    if btc.get('sl_val') is not None and btc.get('sl_val') != 0 and btc.get('tp_val') is not None:
+        btc_sl_val, btc_tp_val, btc_rr_str = btc.get('sl_val'), btc.get('tp_val'), btc.get('rr_str')
+    else:
+        btc_sl_val, btc_tp_val, btc_rr_str = calc_sl_tp(btc_pf, btc_near_s, btc_near_r, btc_atr, btc_pos)
+    if eth.get('sl_val') is not None and eth.get('sl_val') != 0 and eth.get('tp_val') is not None:
+        eth_sl_val, eth_tp_val, eth_rr_str = eth.get('sl_val'), eth.get('tp_val'), eth.get('rr_str')
+    else:
+        eth_sl_val, eth_tp_val, eth_rr_str = calc_sl_tp(eth_pf, eth_near_s, eth_near_r, eth_atr, eth_pos)
 
     lines = []
 
@@ -482,7 +570,7 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
     lines.append(f''); lines.append(f'🌍 宏观给不给面子？')
     mp2 = []
     if fg_val is not None:
-        if fg_val < 25: mp2.append(f'FG={fg_val}极度恐惧——历史大底区，做空是逆势')
+        if fg_val < 25: mp2.append(f'FG={fg_val}极度恐惧——情绪触底，做空盈亏比恶化但不等于见底')
         elif fg_val < 45: mp2.append(f'FG={fg_val}恐惧——散户不敢买，机构默默收')
         elif fg_val < 55: mp2.append(f'FG={fg_val}中性——市场冷静期')
         elif fg_val < 75: mp2.append(f'FG={fg_val}贪婪——追高需谨慎')
@@ -523,7 +611,7 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
                      'WLD','STRK','TIA','PEPE','SHIB','WIF','BONK','FLOKI','TON','ATOM','FIL','ICP','ALGO',
                      'VET','HBAR','STX','FTM','EGLD','FLOW','QNT','GRT','SAND','MANA','AXS','GALA','IMX',
                      'ENA','JUP','PYTH','JTO','W','TNSR','MEW','POPCAT','BOME','MYRO','币安','火币','Bybit',
-                     'Upbit','DEX','CEX','Layer2','L2','L1','Altcoin','山寨','SOL','memecoin','memes',
+                     'Upbit','DEX','CEX','Layer2','L2','L1','Altcoin','山寨','memecoin','memes',
                      '伊朗','中东','地缘','油','能源','制裁','黄金']
         # 黑名单：排除纯商品/行业类新闻 + 传统财经（A股/港股/上证/深证等）
         blacklist_kw = ['钢铁','螺纹钢','建筑钢','钢厂','大豆','棕榈','镍矿','锂企',
@@ -578,7 +666,7 @@ def generate_social_draft(analyses, regime_result, fg_val, fg_label, review_text
         else:
             lines.append(f'💬 {regime}共振偏弱，顺势而为不猜底。')
     elif btc_dir_label == '偏多':
-        if fg_val is not None and fg_val < 25: lines.append(f'💬 FG={fg_val}极度恐惧——历史上这个位置做空的都成了燃料。')
+        if fg_val is not None and fg_val < 25: lines.append(f'💬 FG={fg_val}极度恐惧——恐慌不意味见底，等结构确认再动手。')
         elif '分歧' in str(bt_resonance):
             lines.append(f'💬 {regime}偏多分歧，顺势而为。')
         else:

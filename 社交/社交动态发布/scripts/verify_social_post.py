@@ -5,7 +5,7 @@
       从 stdin: echo "post text" | python3 verify_social_post.py -
 """
 import subprocess, sys, re, json, os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from _shared import BJT
 
 ANALYSES_FILE = '/root/.hermes/trade_review/social_analyses.json'
@@ -17,6 +17,27 @@ MAX_AGE_MIN = 120  # 分析记录最大允许年龄（分钟）
 TOL_PRICE_PCT = 0.03   # 价格 ±3%
 TOL_NUM_PCT  = 0.05    # 裸数字 ±5%
 TOL_RATIO    = 0.1     # RR 比率 ±0.1
+
+def parse_iso_timestamp(ts_str):
+    """安全解析ISO时间戳，兼容T分隔符和空格分隔符格式。
+    返回 timezone-aware datetime，失败返回 None。"""
+    if not ts_str:
+        return None
+    try:
+        # Python 3.11+ fromisoformat 支持空格分隔，3.7-3.10 不支持
+        dt = datetime.fromisoformat(ts_str)
+    except ValueError:
+        # 尝试空格分隔格式（如 '2026-06-22 10:30:00'）
+        try:
+            dt = datetime.strptime(ts_str, '%Y-%m-%dT%H:%M:%S')
+        except ValueError:
+            try:
+                dt = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=BJT)  # naive时间戳默认为BJ
+    return dt
 
 def _find_in_text(text, pattern, group=1):
     """在文本中正则搜索，返回捕获组的值。未找到返回 None。"""
@@ -60,9 +81,9 @@ def _load_analyses():
         if not coin_name or coin_name in ('FG', 'REVIEW'):
             continue
         try:
-            ts = datetime.fromisoformat(r['timestamp'])
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=BJT)
+            ts = parse_iso_timestamp(r['timestamp'])
+            if ts is None:
+                continue
             age = (now - ts).total_seconds() / 60
             if age <= MAX_AGE_MIN:
                 if coin_name not in out_ts or ts > out_ts[coin_name]:
@@ -73,12 +94,10 @@ def _load_analyses():
     # FG record — 按时间戳取最新（#7）
     fg_candidates = []
     for r in records:
-        # FIX: fg_val 可能为 0（极端恐惧），不能用 falsy 判断
         if r.get('coin') == 'FG' and r.get('fg_val') is not None:
-            try:
-                fg_candidates.append((datetime.fromisoformat(r['timestamp']), r))
-            except Exception:
-                fg_candidates.append((datetime.min.replace(tzinfo=timezone.utc), r))
+            ts = parse_iso_timestamp(r.get('timestamp', ''))
+            if ts:
+                fg_candidates.append((ts, r))
     if fg_candidates:
         fg_candidates.sort(key=lambda x: x[0])
         out['FG'] = fg_candidates[-1][1]
@@ -150,7 +169,7 @@ def verify_structured(post_text, analyses):
         position = rec.get('position', '')
         
         # 观望方向 → 跳过结构化 🎯 校验（无入场/止损/止盈数字），但仍检查叙事字段
-        if '观望' in str(position):
+        if not position or '观望' in str(position):
             # 检查文案是否误加了带数字的 🎯 行（如「入场64200」出现在观望币种中）
             m_obs = re.search(rf'🎯\s*{coin}[^\n]*?\d+', post_text)
             if m_obs:

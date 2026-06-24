@@ -12,29 +12,11 @@
 支持别名: 比特币/大饼→BTC, 以太坊/以太→ETH, 索拉纳/sol→SOL, 狗币/狗狗币→DOGE
 ============================================================================
 """
-import os, sqlite3, json, subprocess, sys, math, time
+import os, sqlite3, json, subprocess, sys, math, time, re
 from datetime import datetime, timezone, timedelta
-from _shared import BJT, TRADE_DIR
-
-# ── Retry helper for flaky API calls ──────────────────────────────
-def _retry(fn, max_retries=5, delay=1.5):
-    """Exponential backoff retry for transient failures."""
-    for attempt in range(max_retries):
-        try:
-            result = fn()
-            if isinstance(result, dict) and result.get('_error'):
-                err = str(result['_error']).lower()
-                if any(k in err for k in ['timed out', 'reset', 'refused', 'no_data', '51001']):
-                    if attempt < max_retries - 1:
-                        time.sleep(delay * (2 ** attempt))
-                        continue
-            return result
-        except (subprocess.TimeoutExpired, json.JSONDecodeError):
-            if attempt < max_retries - 1:
-                time.sleep(delay * (2 ** attempt))
-                continue
-            return {'_error': f'failed after {max_retries} retries'}
-    return {'_error': f'failed after {max_retries} retries'}
+from _shared import BJT, TRADE_DIR, _retry
+from chanlun import analyze_chanlun
+from sltp_engine import decision_engine
 
 # =========================== 配置 ===========================
 DB = '/root/.hermes/trade_review/okx_klines.db'
@@ -48,9 +30,9 @@ def _now_ms():
 ANALYSES_FILE = f'{TRADE_DIR}/analyses.json'
 REVIEWS_PATH = f'{TRADE_DIR}/reviews.json'
 
-# 币安 API Key（提升限额 + 防 451）
-# ⚠️ 安全警告：生产环境请用环境变量或 vault，勿硬编码 API Key；此 Key 仅限个人脚本内部使用
-BINANCE_API_KEY = '6Dg88CFpt5ELADagMU248s1f84wa7shjYtbTvIk0wOF1pASd1syNsYPnllnPm2Ku'
+# 币安 API Key（从环境变量读取，切勿硬编码）
+# 用法: export BINANCE_API_KEY='your_key_here'
+BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '')
 
 TF_MS = {
     '1D':  86400000,   # 日线
@@ -107,6 +89,21 @@ def check_extreme_oversold(rsi_1d, fg_val):
         return True, '[X1] RSI<20+FG<15 → V反概率极高，空头信号降级为观望'
     return False, None
 
+def detect_v_reversal(closed_4h, ticker_last=None):
+    """V反检测：过去8根4H从最低点反弹>3%则触发。
+    返回 (is_reversal, recovery_pct)。供 _social_publish 和主流程共用。"""
+    if not closed_4h or len(closed_4h) < 8:
+        return False, 0
+    lows_8 = [r[3] for r in closed_4h[-8:]]
+    min_low = min(lows_8)
+    last_val = ticker_last if ticker_last and ticker_last != '?' else closed_4h[-1][4]
+    try:
+        current = float(last_val)
+    except (ValueError, TypeError):
+        current = closed_4h[-1][4]
+    recovery_pct = (current - min_low) / min_low * 100 if min_low > 0 else 0
+    return recovery_pct > 3, recovery_pct
+
 def check_data_event_window():
     """X3: 重大数据事件前48h+后12h → 方向置信度最低
     动态检测最近/即将发生的重大事件（CPI/FOMC/非农）"""
@@ -162,9 +159,10 @@ def check_coin_lessons(coin, rsi_1d_val, fg_val, indicators, is_data_event=False
             if rsi_1d_val is not None and rsi_1d_val < 25:
                 warnings.append(f'[{code}] {action}')
         elif code == 'E2':
-            # 小TF信号<24h失效 — always warn for mid/long-term analysis
+            # DEAD: 小TF信号<24h失效 — 无条件触发无量化阈值，已禁用
             # Note: short-TF signals expire within 24h; day-level SOS confirmation required
-            warnings.append(f'[E2] {action}')
+            # warnings.append(f'[E2] {action}')
+            pass
         elif code == 'E3':
             # Rebound elasticity > BTC
             if rsi_1d_val is not None and rsi_1d_val < 33 and fg_val is not None and fg_val < 25:
@@ -210,7 +208,7 @@ def calc_position(coin, entry, sl, account_usd=None, risk_pct=None):
 
     # 爆仓距离估算：杠杆倍数 → 爆仓距 = 100/杠杆% - 维护保证金%
     mm_pct = MARGIN_MAINTENANCE.get(coin, 1.5)
-    liq_pct = 100 / LEVERAGE - mm_pct  # BTC=4.5%, ETH=4.0%
+    liq_pct = 100 / LEVERAGE - mm_pct  # 简化公式: 100/杠杆 - 维持保证金率。精确爆仓价需逐仓保证金+持仓均价计算，此简化保守偏低约0.5-1%
 
     return {
         'risk_usd': risk_usd,
@@ -356,7 +354,7 @@ def calc_adx(highs, lows, closes, period=14):
     tr_smooth = sum(tr_window) / period
     dm_p_smooth = sum(dm_p_window) / period
     dm_m_smooth = sum(dm_m_window) / period
-    for i in range(len(tr_list)):
+    for i in range(period, len(tr_list)):
         tr_smooth = (tr_smooth * (period - 1) + tr_list[i]) / period
         dm_p_smooth = (dm_p_smooth * (period - 1) + dm_p[i]) / period
         dm_m_smooth = (dm_m_smooth * (period - 1) + dm_m[i]) / period
@@ -457,7 +455,7 @@ def candle_body_label(r):
 
 
 def trend_direction(rows):
-    """道氏方向：HH/HL = 上升, LH/LL = 下降 (基于已收盘蜡烛收盘价)"""
+    """道氏方向——简化实现：连续收盘价比较,非完整道氏HH/HL高点低点分析"""
     if len(rows) < 4:
         return '数据不足'
     prices = [r[4] for r in rows[-4:]]
@@ -469,7 +467,7 @@ def trend_direction(rows):
         return '盘整'
 
 
-def check_acceleration(days, tf='1D'):
+def check_acceleration(days):
     """
     趋势加速检查 — 判断能否标 near_bottom
     日线实体逐根放大 = 加速下跌 → 禁用 near_bottom
@@ -665,7 +663,7 @@ def fetch_binance_sentiment(coin):
     try:
         r1 = subprocess.run(['curl', '-s', '--max-time', '8',
             '-H', f'X-MBX-APIKEY: {BINANCE_API_KEY}',
-            f'https://fapi.binance.com/fapi/v1/globalLongShortAccountRatio'
+            f'https://fapi.binance.com/fapi/v1/longShortRatio'
             f'?symbol={coin}USDT&period=5m&limit=1'],
             capture_output=True, text=True, timeout=12)
         d1 = json.loads(r1.stdout) if r1.stdout else []
@@ -846,7 +844,7 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
     levels_4h = get_levels('4H')
 
     # ──── 底部研判 ────
-    rsi_1d = indicators['1D'].get('rsi')
+    rsi_1d = indicators['1D'].get('rsi', 50)
     near_bottom = False
     bottom_note = '-'
     if rsi_1d is not None:
@@ -890,12 +888,14 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
     risks = []
     lessons_warnings = []
 
-    rsi_1d_val = indicators['1D'].get('rsi')
-    is_x1, x1_msg = check_extreme_oversold(rsi_1d_val, fg_val)
+    is_x1, x1_msg = check_extreme_oversold(rsi_1d, fg_val)
     if is_x1:
         lessons_warnings.append(x1_msg)
-        near_bottom = True  # X1 is strongest near_bottom signal — RSI<20+FG<15 = V反
-        bottom_note = f'{x1_msg} — RSI<20+FG<15确认极端超卖，near_bottom强制启用'
+        if accel != 'accelerating_bear':
+            near_bottom = True  # X1 is strongest near_bottom signal — RSI<20+FG<15 = V反
+            bottom_note = f'{x1_msg} — RSI<20+FG<15确认极端超卖，near_bottom强制启用'
+        else:
+            bottom_note = f'{x1_msg} — RSI<20+FG<15极端超卖但加速下跌中，near_bottom禁用'
 
     is_x3, x3_msg = check_data_event_window()
     if is_x3:
@@ -903,7 +903,7 @@ def analyze_single_coin(conn, coin, ticker, funding, fg_val, fg_label):
         risks.append(x3_msg)
 
     # ──── COIN_LESSONS 币种约束检查 ────
-    coin_warnings = check_coin_lessons(coin, rsi_1d_val, fg_val, indicators, is_data_event=is_x3)
+    coin_warnings = check_coin_lessons(coin, rsi_1d, fg_val, indicators, is_data_event=is_x3)
     for cw in coin_warnings:
         lessons_warnings.append(cw)
 
@@ -1048,7 +1048,10 @@ def session_vp(coin, conn):
         sorted_bins = sorted(bins.items(), key=lambda x: x[0])
         poc_val = max(bins, key=bins.get)
         cum = 0
-        poc_idx = next((i for i, (p, _) in enumerate(sorted_bins) if abs(p - poc_val) < (bin_step * 0.5 if bin_step else 1)), 0)
+        try:
+            poc_idx = next(i for i, (p, _) in enumerate(sorted_bins) if abs(p - poc_val) < (bin_step * 0.5 if bin_step else 1))
+        except StopIteration:
+            poc_idx = min(range(len(sorted_bins)), key=lambda i: abs(sorted_bins[i][0] - poc_val))
         left, right = poc_idx, poc_idx
         cum = sorted_bins[poc_idx][1]
         target_vol = total_vol * 0.7
@@ -1093,7 +1096,7 @@ def detect_kline_patterns(a, lookback=15):
             total_range = h - l if h > l else 0.0001
             entity_pct = abs(entity) / total_range * 100
             ts = r[0] / 1000
-            t_bj = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8)))
+            t_bj = datetime.fromtimestamp(ts, tz=BJT)
             date_str = t_bj.strftime('%m-%d %H:%M')
             range_low_all = min(x[3] for x in recent)
             range_high_all = max(x[2] for x in recent)
@@ -1118,14 +1121,19 @@ def detect_kline_patterns(a, lookback=15):
             range_high = max(x[2] for x in recent)
             range_span = range_high - range_low if range_high > range_low else 1
             vol = r[5] if len(r) > 5 else 0
+            # 无害冗余: len(x)>5 检查 — kline tuple 固定≥6元,但保留此检查防止数据源异常时崩溃
             avg_vol = sum(x[5] for x in recent[-10:-1] if len(x) > 5) / max(1, len([x for x in recent[-10:-1] if len(x) > 5]))
             near_bottom = (l - range_low) < range_span * 0.10
             if (total_range > 0 and (c - l) > total_range * 0.70 and c > o
                 and near_bottom and (avg_vol == 0 or vol > avg_vol * 0.8)):
                 patterns.append((tf, date_str, 'Spring', f'下影{((c-l)/total_range*100):.0f}%底部反弹'))
-            if (total_range > 0 and (h - max(c, o)) > total_range * 0.6):
+            avg_vol_4 = sum(x[5] for x in recent[-5:-1] if len(x) > 5) / max(1, len([x for x in recent[-5:-1] if len(x) > 5]))
+            if (total_range > 0 and (h - max(c, o)) > total_range * 0.6
+                and avg_vol_4 > 0 and vol > avg_vol_4 * 1.2):
                 patterns.append((tf, date_str, 'UTAD', '冲高放量回落'))
-            if (entity_pct < 30 and c < po):
+            closes_last3 = [x[4] for x in recent[-3:] if len(x) > 4]
+            uptrend = len(closes_last3) == 3 and closes_last3[0] < closes_last3[1] < closes_last3[2]
+            if (uptrend and entity_pct < 30 and c < po):
                 vol = r[5] if len(r) > 5 else 0
                 valid_vols_lps = [x[5] for x in recent[-10:-1] if len(x) > 5]
                 avg_vol = sum(valid_vols_lps) / max(1, len(valid_vols_lps)) if recent else 0
@@ -1161,7 +1169,7 @@ def wyckoff_detect(a):
     avg_vol = sum(r[5] for r in recent) / len(recent)
     sc_idx = all_lows.index(range_low)
     sc_vol = recent[sc_idx][5]
-    sc_vol_ratio = sc_vol / avg_vol
+    sc_vol_ratio = sc_vol / avg_vol if avg_vol > 0 else 0
     recent_10 = recent[-10:]
     latest_close = recent[-1][4]
     # ── Derive time-ordered swing highs/lows from candle data (most recent first) ──
@@ -1253,7 +1261,8 @@ def wyckoff_detect(a):
         detail_parts.append('SC巨量' + format(sc_vol_ratio, '.1f') + 'x')
     detail_parts.append('回升' + format(recovery_pct, '.1f') + '%')
     detail_parts.append('结构:' + ('HH+HL' if hh_hl else ('HL成立' if hl_ok else '整理中')))
-    return {'phase': phase, 'events': events, 'confidence': confidence, 'detail': ' | '.join(detail_parts)}
+    return {'phase': phase, 'events': events, 'confidence': confidence, 'detail': ' | '.join(detail_parts),
+            'swing_lows': swing_lows, 'swing_highs': swing_highs}
 
 def _format_coin_section(a):
     """Format one coin's output block. Mutates `a` with near_support/resistance/_pos_dir/_entry/_sl/_tp/_rr. Returns list of lines."""
@@ -1293,7 +1302,7 @@ def _format_coin_section(a):
         macd_s = f'{d["macd_h"]:.0f}' if d['macd_h'] is not None else '-'
         adx_s = f'{d["adx"]:.0f}' if d['adx'] else '-'
         bb_s = f'{d["bb"]["pct_b"]:.0f}%' if d.get('bb') else '-'
-        lbl = d['label'] if d['label'] not in ('普通+', '普通-', '-', '大阳+', '大阴-') else '·'
+        lbl = d['label'] if d['label'] not in ('普通+', '普通-', '-') else '·'
         c_val = d['last_close']
         if c_val >= 100:   c_s = f'{c_val:.0f}'
         elif c_val >= 1:   c_s = f'{c_val:.2f}'
@@ -1309,7 +1318,7 @@ def _format_coin_section(a):
     of_parts = []
     for k, label in [('openInterest','OI'),('longShortRatio','多空'),('takerRatio','Taker')]:
         v = extra.get(k)
-        if v:
+        if v is not None:
             try:
                 if k == 'openInterest': of_parts.append(f'{label}={float(v)/1e6:.1f}M')
                 else: of_parts.append(f'{label}={float(v):.2f}')
@@ -1332,7 +1341,7 @@ def _format_coin_section(a):
     atr_band = cp * 0.01
     if len(closed_4h) >= 5:
         recent = closed_4h[-8:]
-        atr_4h = a['indicators']['4H'].get('atr', cp * 0.02)
+        atr_4h = a['indicators']['4H'].get('atr') or cp * 0.02
         atr_band = max(atr_4h * 2, cp * 0.01)
         if cp >= 1:
             highs_near = sorted(set(round(r[2], 2) for r in recent if r[2] > cp and r[2] - cp <= atr_band), reverse=True)[:2]
@@ -1345,6 +1354,10 @@ def _format_coin_section(a):
     if not lows_near:
         low_levels = a.get('levels_4h', {}).get('lows', [])
         lows_near = [x for x in low_levels if x < cp][:2] if cp > 1 else low_levels[:2]
+        if not lows_near and cp > 0:
+            # 价格跌破所有历史支撑 → 用 ATR 估算
+            atr_est = a['indicators']['4H'].get('atr') or cp * 0.02
+            lows_near = [round(cp - atr_est * 1.5, 2), round(cp - atr_est * 2.0, 2)]
     if not highs_near:
         wider = a['close_status']['4H']['closed'][-50:]
         all_highs = sorted(set(round(r[2], 2) for r in wider if r[2] > cp and r[2] - cp <= atr_band * 2.5), reverse=True)
@@ -1358,7 +1371,8 @@ def _format_coin_section(a):
     rsi4_s = f'{a["rsi_4h"]:.0f}' if a["rsi_4h"] is not None else '?'
     macd4_s = f'{a["macd_h_4h"]:.0f}' if a["macd_h_4h"] is not None else '?'
     lines.append(f'技术: S={s_str} | R={r_str}')
-    lines.append(f'共振: {a["resonance"]} (4H_RSI={rsi4_s} MACD_h={macd4_s} %b={a["pct_b"]:.0f}%)')
+    pct_b_s = f'{a["pct_b"]:.0f}%' if a["pct_b"] is not None else '?'
+    lines.append(f'共振: {a["resonance"]} (4H_RSI={rsi4_s} MACD_h={macd4_s} %b={pct_b_s})')
     wk = wyckoff_detect(a)
     if wk['confidence'] > 0:
         events_str = ' | '.join(wk['events']) if wk['events'] else '无显著事件'
@@ -1391,70 +1405,143 @@ def _format_coin_section(a):
     atr_4h = ind['4H'].get('atr', 0)
     trend_1d = ind['1D'].get('trend', '')
     trend_4h = ind['4H'].get('trend', '')
-    # 仓位方向判定：共振优先 + near_bottom/near_top + MACD/RSI 为辅
+    # ════════════════════════════════════════════════════════════
+    # 仓位方向判定 v062309 — 威科夫 + 缠论 + 道氏 + 共振 四层架构
+    # ════════════════════════════════════════════════════════════
     resonance = a.get('resonance', '')
-    if '强' in str(resonance) or (a.get('near_bottom') and macd_4h_val is not None and macd_4h_val > -50 and rsi_1h_val < 45):
+    wyckoff_events = wk.get('events', [])
+    wyckoff_conf = wk.get('confidence', 0)
+    events_str = ' '.join(wyckoff_events)
+    
+    pos_dir = None
+    
+    # 预计算缠论（后续 L0.5 和 SL/TP 段都用到 cl_result）
+    cl_result = None
+    if closed_4h and len(closed_4h) >= 60:
+        h4h = [r[2] for r in closed_4h]; l4h = [r[3] for r in closed_4h]; c4h = [r[4] for r in closed_4h]
+        try: cp_cl = float(t.get('last', 0))
+        except: cp_cl = c4h[-1] if c4h else 0
+        cl_result = analyze_chanlun(h4h, l4h, c4h, cp_cl)
+    
+    # L0: 威科夫结构信号
+    if any('Spring' in e for e in wyckoff_events) and 'SOS' in events_str and wyckoff_conf >= 50:
         pos_dir = '试多'
-    elif '弱' in str(resonance) or (rsi_1d > 65 and macd_4h_val is not None and macd_4h_val < -50):
-        pos_dir = '试空'
-    elif rsi_1d > 67 and trend_1d in ('下降', '偏空') and macd_4h_val is not None and macd_4h_val < 0:
-        pos_dir = '试空'  # L1: near_top 做空捷径，跳过共振门槛
-    elif a.get('near_bottom'):
-        pos_dir = '试多'  # #4: near_bottom→偏多 even in neutral resonance
-    else:
+    elif any('UTAD' in e for e in wyckoff_events) and wyckoff_conf >= 50:
+        svp = a.get('session_vp', {})
+        vah = svp.get('vah', 0)
+        try: tp_f = float(t.get('last', 0)) if t.get('last') and t.get('last') != '?' else 0
+        except: tp_f = 0
+        if tp_f > 0 and vah > 0 and tp_f < vah:
+            pos_dir = '试空'
+    
+    # L0.5: 缠论买卖点（cl_result 已预计算）
+    if pos_dir is None and cl_result:
+        if '一买' in cl_result['points']['buy'] or '二买' in cl_result['points']['buy']:
+            pos_dir = '试多'
+        elif '一卖' in cl_result['points']['sell'] or '二卖' in cl_result['points']['sell']:
+            pos_dir = '试空'
+    
+    # L1: 道氏多周期趋势
+    if pos_dir is None:
+        if trend_1d in ('上升',) and trend_4h in ('上升', '偏多'):
+            pos_dir = '试多'
+        elif trend_1d in ('下降',) and trend_4h in ('下降', '偏空'):
+            pos_dir = '试空'
+    
+    # L2: 共振 + near_bottom
+    if pos_dir is None:
+        if '强' in str(resonance) or (a.get('near_bottom') and macd_4h_val is not None and macd_4h_val > -50 and rsi_1h_val < 45):
+            pos_dir = '试多'
+        elif '弱' in str(resonance) or (rsi_1d > 65 and macd_4h_val is not None and macd_4h_val < -50):
+            pos_dir = '试空'
+        elif rsi_1d > 67 and trend_1d in ('下降', '偏空') and macd_4h_val is not None and macd_4h_val < 0:
+            pos_dir = '试空'
+        elif a.get('near_bottom'):
+            pos_dir = '试多'
+    
+    if pos_dir is None:
         pos_dir = '观望'
-    # L3: V反保护 — 底部区域/反弹中禁止做空
+    
+    # V反保护
     if pos_dir == '试空':
         if a.get('near_bottom'):
             pos_dir = '观望（near_bottom保护）'
-        elif closed_4h and len(closed_4h) >= 8:
-            # 检测过去 8 根 4H 是否从低点反弹 > 3%（Spring/V反特征）
-            lows_8 = [r[3] for r in closed_4h[-8:]]
-            min_low = min(lows_8)
-            _last_val = t.get('last', closed_4h[-1][4])
-            try:
-                current = float(_last_val) if _last_val and _last_val != '?' else 0
-            except (ValueError, TypeError):
-                current = 0
-            recovery_pct = (current - min_low) / min_low * 100 if min_low > 0 else 0
-            if recovery_pct > 3:
-                pos_dir = '观望（反弹{:.1f}%，V反保护）'.format(recovery_pct)
+        elif closed_4h:
+            is_rev, rec_pct = detect_v_reversal(closed_4h, t.get('last'))
+            if is_rev:
+                pos_dir = '观望（反弹{:.1f}%，V反保护）'.format(rec_pct)
+    # ════════════════════════════════════════════════════
+    # SL/TP + 仓位 v062309 — decision_engine 三层解耦
+    # ════════════════════════════════════════════════════
     entry = sl = tp = rr = None
+    plan = None
     if pos_dir.startswith('试') and lows_near and highs_near and atr_4h:
-        entry = float(t.get('last', cp))  # P1a: 用 ticker 现价
-        if pos_dir == '试多':
-            sl = lows_near[0] - atr_4h * 0.5
-            tp = highs_near[0]
-        else:  # 试空
-            sl = highs_near[0] + atr_4h * 0.5
-            tp = lows_near[0]
-        rr = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
-        pos_line = f'仓位: {pos_dir} | 入场{_fmt_price(entry)} | SL{_fmt_price(sl)} | TP{_fmt_price(tp)} | 盈亏比 1:{rr:.1f}'
-        if rr < 1.5:
-            pos_line += ' ⚠️'
-        pos = calc_position(coin, entry, sl)
-        if pos and not pos['liq_safe']:
-            pos_line = f'仓位: 观望 | ⛔爆仓距{pos["liq_pct"]:.1f}%<SL距{pos["sl_pct"]:.1f}% — 不宜开仓'
-            pos_dir = '观望'
-            entry = sl = tp = rr = None
+        try: entry = float(t.get('last', cp))
+        except: entry = cp if cp else 0
+        direction = 'LONG' if pos_dir == '试多' else 'SHORT'
+        tp1_val = highs_near[-1] if direction == 'LONG' else lows_near[-1]
+        # tp2: 4H结构最高点/最低点（最近80根4H K线）
+        if direction == 'LONG':
+            all_h4_highs = [r[2] for r in closed_4h[-80:]]
+            valid = [h for h in all_h4_highs if h > entry]
+            tp2_val = max(valid) if valid else None
+        else:
+            all_h4_lows = [r[3] for r in closed_4h[-80:]]
+            valid = [l for l in all_h4_lows if l < entry]
+            tp2_val = min(valid) if valid else None
+        svp = a.get('session_vp', {}); vah, val = svp.get('vah',0), svp.get('val',0)
+        close_1d_s = ind.get('1D',{}).get('closed',[])
+        d1_h = max(r[2] for r in close_1d_s[-5:]) if len(close_1d_s)>=5 else 0
+        d1_l = min(r[3] for r in close_1d_s[-5:]) if len(close_1d_s)>=5 else 0
+        tp3_val = max(vah, d1_h) if direction=='LONG' and (vah or d1_h) else None
+        tp3_val = min(v for v in [val, d1_l] if v > 0) if direction=='SHORT' and (val>0 or d1_l>0) else tp3_val
+        sw_lows = wk.get('swing_lows', []); sw_highs = wk.get('swing_highs', [])
+        sw_l = sw_lows[-1] if sw_lows else None; sw_h = sw_highs[-1] if sw_highs else None
+        cl_zd = cl_result['hubs'][-1]['ZD'] if cl_result and cl_result.get('hubs') else None
+        l1_ok = (trend_1d in ('上升',) and trend_4h in ('上升','偏多')) or (trend_1d in ('下降',) and trend_4h in ('下降','偏空'))
+        # 信号层级: L0=威科夫(需完整条件), L0.5=缠论, L1=道氏, L2=共振
+        if pos_dir == '试多' or pos_dir == '试空':
+            wyckoff_conf_val = wk.get('confidence', 0)
+            has_spring_sos = any('Spring' in e for e in wk.get('events',[])) and 'SOS' in ' '.join(wk.get('events',[])) and wyckoff_conf_val >= 50
+            has_utad = any('UTAD' in e for e in wk.get('events',[])) and wyckoff_conf_val >= 50
+            if has_spring_sos or has_utad:
+                sig_lvl = 'L0'
+            elif cl_result and ('一买' in cl_result.get('points',{}).get('buy',[]) or '一卖' in cl_result.get('points',{}).get('sell',[])):
+                sig_lvl = 'L0'
+            elif l1_ok: sig_lvl = 'L1'
+            else: sig_lvl = 'L2'
+        else: sig_lvl = 'L2'
+        # tp2年龄: 从closed_4h中找到最高点对应的时间差
+        tp2_age = None
+        if tp2_val and closed_4h:
+            for r in reversed(closed_4h):
+                if abs(r[2] - tp2_val) < 1: tp2_age = (datetime.now(BJT) - datetime.fromtimestamp(r[0]/1000, BJT)).days if r[0] else None; break
+        plan = decision_engine(direction=direction, entry=entry, atr=atr_4h,
+            near_support=lows_near, near_resistance=highs_near,
+            swing_low=sw_l, swing_high=sw_h, chanlun_zd=cl_zd,
+            tp1=tp1_val, tp2=tp2_val, tp3=tp3_val,
+            tp2_age_days=tp2_age, signal_level=sig_lvl, l1_aligned=l1_ok)
+        if plan.risk_pct > 0:
+            sl, tp, rr = plan.sl, plan.tp, plan.rr
+            risk_label = '轻仓' if plan.risk_pct<=0.006 else ('标准' if plan.risk_pct<=0.014 else '强趋势')
+            pos_line = f'仓位: {pos_dir} | 入场{_fmt_price(entry)} | SL{_fmt_price(sl)} | TP{_fmt_price(tp)}({plan.tp_source}) | RR 1:{rr:.1f} | {risk_label}'
+            pos = calc_position(coin, entry, sl)
+            if pos is None: pos_dir = '观望'; pos_line = '仓位: 观望 | 无法计算仓位'; pos = None
+            elif not pos.get('liq_safe', True): pos_dir = '观望'; pos_line = '仓位: 观望 | 爆仓距不足'; pos = None
+        else:
+            pos_dir = '观望（{}）'.format(plan.blocked_reason or 'SL/TP无效'); pos_line = '仓位: '+pos_dir; pos = None
     elif pos_dir.startswith('观望'):
         pos_line = '仓位: ' + pos_dir
     else:
-        pos_line = f'仓位: {pos_dir}（数据不足，无法计算精确SL/TP）'
-    a['_pos_dir'] = pos_dir
-    a['_entry'] = entry
-    a['_sl'] = sl
-    a['_tp'] = tp
-    a['_rr'] = rr
+        pos_line = f'仓位: {pos_dir}（数据不足）'
+    a['_pos_dir'] = pos_dir; a['_entry'] = entry; a['_sl'] = sl; a['_tp'] = tp; a['_rr'] = rr
     lines.append(pos_line)
-    if pos_dir.startswith('试') and '入场' in pos_line:
-        pos = calc_position(coin, entry, sl)
-        if pos:
-            slp = pos["sl_pct"]
-            c_s = f'{pos["contracts"]:.1f}张' if pos['contracts'] >= 1 else f'{pos["contracts"]:.2f}张'
-            liq_price = entry * (1 - pos['liq_pct']/100) if pos_dir == '试多' else entry * (1 + pos['liq_pct']/100)
-            safe = '✅' if pos['liq_safe'] else '⚠️爆仓距<止损'
-            lines.append(f'  仓位公式: SL距{slp:.1f}% | 每$100(2%风险)可开{c_s} | 爆仓价{liq_price:.1f}(距{pos["liq_pct"]:.1f}%) | 安全{safe}')
+    if pos_dir.startswith('试') and '入场' in pos_line and pos and plan:
+        slp = pos["sl_pct"]
+        c_s = f'{pos["contracts"]:.1f}张' if pos['contracts'] >= 1 else f'{pos["contracts"]:.2f}张'
+        liq_price = entry*(1-pos['liq_pct']/100) if pos_dir=='试多' else entry*(1+pos['liq_pct']/100)
+        safe = '✅' if pos['liq_safe'] else '⚠️爆仓距<止损'
+        lines.append(f'  仓位公式: SL距{slp:.1f}% | 每$100({plan.risk_pct*100:.1f}%风险)可开{c_s} | 爆仓价{liq_price:.1f}(距{pos["liq_pct"]:.1f}%) | 安全{safe}')
     return lines
 
 
@@ -1643,42 +1730,7 @@ def get_regime_result():
 
 # =========================== 主入口 ===========================
 
-def _pos_quick(a):
-    """Fast position derivation from resonance + near_bottom + RSI/MACD.
-    Returns '偏多', '偏空', or '观望（等确认）'.
-    Used as fallback when analysis dict has no explicit 'position' key."""
-    resonance = a.get('resonance', '')
-    near_bottom = a.get('near_bottom', False)
-    rsi_1d = (a.get('indicators', {}).get('1D', {}).get('rsi') or 50)
-    macd_4h = a.get('macd_h_4h')  # keep None if missing
-    trend_1d = a.get('indicators', {}).get('1D', {}).get('trend', '')
-    rsi_1h = a.get('rsi_1h', 50)
-    
-    if '强' in str(resonance) or (near_bottom and macd_4h is not None and macd_4h > -50 and rsi_1h < 45):
-        return '偏多'
-    elif '弱' in str(resonance) or (rsi_1d > 65 and macd_4h is not None and macd_4h < -50):
-        position = '偏空'
-    elif rsi_1d > 67 and trend_1d in ('下降', '偏空') and macd_4h is not None and macd_4h < 0:
-        position = '偏空'
-    elif near_bottom:
-        return '偏多'  # #4: near_bottom→偏多 even in neutral resonance
-    else:
-        return '观望（等确认）'
-    
-    # L3: V反保护 — 底部区域/反弹中禁止做空 (与 _format_coin_section 对齐)
-    if position == '偏空':
-        if near_bottom:
-            return '观望（near_bottom保护）'
-        closed_4h = a.get('close_status', {}).get('4H', {}).get('closed', [])
-        if closed_4h and len(closed_4h) >= 8:
-            lows_8 = [r[3] for r in closed_4h[-8:]]
-            min_low = min(lows_8)
-            ticker = a.get('ticker', {})
-            current = float(ticker.get('last', closed_4h[-1][4]))
-            recovery_pct = (current - min_low) / min_low * 100 if min_low > 0 else 0
-            if recovery_pct > 3:
-                return '观望（反弹{:.1f}%，V反保护）'.format(recovery_pct)
-    return position
+
 
 def main():
     raw = sys.argv[1:]
@@ -1772,14 +1824,12 @@ def main():
         in_db = conn.execute(
             'SELECT COUNT(*) FROM klines WHERE coin=?', (coin,)
         ).fetchone()[0] > 0
+        # Fetch once — same call in both branches
+        ticker = fetch_okx_ticker(f'{coin}-USDT-SWAP')
+        funding = fetch_okx_funding(f'{coin}-USDT-SWAP')
         if in_db:
-            ticker = fetch_okx_ticker(f'{coin}-USDT-SWAP')
-            funding = fetch_okx_funding(f'{coin}-USDT-SWAP')
             extra = {}
         else:
-            ticker = fetch_okx_ticker(f'{coin}-USDT-SWAP')
-            funding = fetch_okx_funding(f'{coin}-USDT-SWAP')
-            extra = {}
             if ticker.get('_error') or ticker.get('last') in (None, '?'):
                 ticker = fetch_binance_ticker(coin)
             if funding.get('_error'):
@@ -1873,7 +1923,7 @@ def main():
             pass
         
         for a in analyses:
-            coin_key = f"{a['coin']}USDT"
+            coin_key = a['coin']
             date_key = _now_bj().strftime('%Y-%m-%d')
             ind = a.get('indicators', {})
             ind_4h = ind.get('4H', {})
@@ -1891,68 +1941,16 @@ def main():
             trend_1h = ind_1h.get('trend', '')
             trend_4h = ind_4h.get('trend', '')
             trend_1d = ind.get('1D', {}).get('trend', '')
-            f_rate = a.get('funding', {})
-            f_rate_val = f_rate.get('rate', '') if not f_rate.get('_error') else ''
-            # Compute sl/tp/rr from near_support/near_resistance (与 _format_coin_section 对齐)
-            near_sup = a.get('near_support', [])
-            near_res = a.get('near_resistance', [])
-            lows = near_sup  # use near_support as primary
-            highs = near_res  # use near_resistance as primary
-            # Fallback to levels_4h if near_support is empty
-            if not lows:
-                levels_4h_fb = a.get('levels_4h', {})
-                lows = levels_4h_fb.get('lows', [])
-            if not highs:
-                levels_4h_fb = a.get('levels_4h', {})
-                highs = levels_4h_fb.get('highs', [])
-            entry_p = a.get('ticker', {}).get('last', 0)
-            try: entry_f = float(entry_p) if entry_p and entry_p != '?' else 0
-            except: entry_f = 0
-            position = a.get('position') or _pos_quick(a)  # #3: fallback derivation from resonance
-            
-            atr_4h = ind_4h.get('atr', 0) or 0
-            if '空' in str(position):
-                # 做空: SL=阻力+0.5ATR, TP=支撑 (ATR-based, 与 _format_coin_section 对齐)
-                sl_val = round(highs[0] + atr_4h * 0.5, 2) if highs and entry_f else 0
-                tp_val = round(lows[0], 2) if lows else 0
-                rr_str = '?'
-                if entry_f and sl_val and tp_val and sl_val > entry_f:
-                    rr = round((entry_f - tp_val) / (sl_val - entry_f), 1)
-                    rr_str = f'{rr:.1f}' if rr > 0 else '?'
-            else:
-                # 做多: SL=支撑-0.5ATR, TP=阻力 (ATR-based, 与 _format_coin_section 对齐)
-                sl_val = round(lows[0] - atr_4h * 0.5, 2) if lows and entry_f else 0
-                tp_val = round(highs[0], 2) if highs else 0
-                rr_str = '?'
-                if entry_f and sl_val and tp_val and entry_f > sl_val:
-                    rr = round((tp_val - entry_f) / (entry_f - sl_val), 1)
-                    rr_str = f'{rr:.1f}' if rr > 0 else '?'
-            
-            # Extract per-TF indicators for complete data storage
-            ind = a.get('indicators', {})
-            kline_table = {}
-            for tf in ['1D', '4H', '1H', '30m', '5m']:
-                tf_data = ind.get(tf, {})
-                if tf_data:
-                    kline_table[tf] = {
-                        'close': tf_data.get('last_close', 0),
-                        'rsi': tf_data.get('rsi', 0),
-                        'macd_h': tf_data.get('macd_h', 0),
-                        'adx': tf_data.get('adx', 0),
-                        'pct_b': tf_data.get('bb', {}).get('pct_b', 0) if isinstance(tf_data.get('bb'), dict) else 0,
-                        'shape': tf_data.get('label', ''),
-                        'trend': tf_data.get('trend', ''),
-                    }
-            
+
             # Extract ticker data
             ticker_data = a.get('ticker', {})
             ticker_full = {}
             if ticker_data:
                 ticker_full = {
                     'last': ticker_data.get('last', ''),
-                    'bid': ticker_data.get('bid', ''),
-                    'ask': ticker_data.get('ask', ''),
-                    'vol': ticker_data.get('vol', ''),
+                    'bid': ticker_data.get('bidPx', ticker_data.get('bid', '')),
+                    'ask': ticker_data.get('askPx', ticker_data.get('ask', '')),
+                    'vol': ticker_data.get('vol24h', ticker_data.get('volume', '')),
                     'change_pct': ticker_data.get('change_pct', ''),
                 }
             
@@ -1961,12 +1959,11 @@ def main():
             funding_full = {}
             if funding_data:
                 funding_full = {
-                    'rate': funding_data.get('rate', ''),
+                    'fundingRate': funding_data.get('fundingRate', ''),
                     'pos_ratio': funding_data.get('pos_ratio', ''),
                 }
             
-            # Extract levels_4h
-            levels_4h = a.get('levels_4h', {})
+            # levels_4h already assigned at L1847 — using same value for levels_full
             levels_full = {
                 'lows': levels_4h.get('lows', []),
                 'highs': levels_4h.get('highs', []),
@@ -2054,9 +2051,9 @@ def main():
             # Fetch flash news (快讯) — 2026-06-20 新增 (循环外拉取一次，多币种共享)
             flash_news = [dict(item) for item in _all_flash_news]
 
-            # Initialize VP and data_vol (filled below)
-            vp_data = {}
-            data_vol = {}
+            # Initialize VP (session_vp filled from analysis, data_vol populated from a.data_vol if available)
+            vp_data = a.get('session_vp', a.get('vp_data', {}))
+            data_vol = a.get('data_vol', {})  # DEAD: analyze_single_coin never writes this field
 
             # Call wyckoff_detect
             wk_result = wyckoff_detect(a) if 'indicators' in a and 'levels_4h' in a else {}
@@ -2071,7 +2068,7 @@ def main():
             
             # Call detect_kline_patterns for Spring/LPS/SOS times
             kline_pattern_times = {}
-            kline_patterns_result = a.get('kline_patterns', []) if 'close_status' in a else []
+            kline_patterns_result = a.get('kline_patterns', {}) if 'close_status' in a else {}
             if kline_patterns_result and 'patterns' in kline_patterns_result:
                 lps_counter = 0  # incrementing counter for LPS indexing
                 for pat in kline_patterns_result['patterns']:
@@ -2086,20 +2083,21 @@ def main():
                     elif ptype == 'SC':
                         kline_pattern_times['SC'] = f'@{time_str}'
             
-            # Extract macro alert from lessons_warnings or resonance
-            macro_alert = a.get('macro_alert', '')
-            if not macro_alert and 'lessons_warnings' in a:
+            # Extract macro alert from lessons_warnings (macro_alert from a always empty)
+            macro_alert = ''
+            if 'lessons_warnings' in a:
                 for lw in a.get('lessons_warnings', []):
                     if 'Breakout' in str(lw) or 'Breakdown' in str(lw):
                         macro_alert = str(lw)
                         break
             
             # Extract position suggestion from resonance + near_bottom/near_top + V反保护 (含8根4H反弹检测)
+            # ⚠️ SYNC: 修改此逻辑需同步 L1387 _format_coin_section 中的 pos_dir 判定。
             position = a.get('position', '')
             if not position:
                 resonance = a.get('resonance', '')
                 near_bottom = a.get('near_bottom', False)
-                rsi_1d = (a.get('indicators', {}).get('1D', {}).get('rsi') or 50)
+                rsi_1d = a.get('indicators', {}).get('1D', {}).get('rsi', 50)
                 rsi_1h = a.get('rsi_1h', 50)
                 trend_1d = a.get('indicators', {}).get('1D', {}).get('trend', '')
                 macd_4h = a.get('macd_h_4h')  # keep None if missing
@@ -2107,7 +2105,7 @@ def main():
                     position = '偏多'
                 elif '弱' in str(resonance) or (rsi_1d > 65 and macd_4h is not None and macd_4h < -50):  # #17: mirror stdout short path
                     position = '偏空'
-                elif rsi_1d > 67 and trend_1d == '下降' and macd_4h is not None and macd_4h < 0:
+                elif rsi_1d > 67 and trend_1d in ('下降', '偏空') and macd_4h is not None and macd_4h < 0:
                     position = '偏空'
                 elif near_bottom:
                     position = '偏多'  # #4: near_bottom→偏多 even in neutral resonance
@@ -2119,18 +2117,29 @@ def main():
                         position = '观望（near_bottom保护）'
                     else:
                         closed_4h = a.get('close_status', {}).get('4H', {}).get('closed', [])
-                        if closed_4h and len(closed_4h) >= 8:
-                            lows_8 = [r[3] for r in closed_4h[-8:]]
-                            min_low = min(lows_8)
-                            ticker = a.get('ticker', {})
-                            _last_val = ticker.get('last', closed_4h[-1][4])
-                            try:
-                                current = float(_last_val) if _last_val and _last_val != '?' else 0
-                            except (ValueError, TypeError):
-                                current = 0
-                            recovery_pct = (current - min_low) / min_low * 100 if min_low > 0 else 0
-                            if recovery_pct > 3:
-                                position = '观望（反弹{:.1f}%，V反保护）'.format(recovery_pct)
+                        is_rev, rec_pct = detect_v_reversal(closed_4h, ticker.get('last'))
+                        if is_rev:
+                            position = '观望（反弹{:.1f}%，V反保护）'.format(rec_pct)
+            # RR门禁: position为偏多/偏空时，用near价位计算RR，<1.0自动降级观望
+            if position in ('偏多', '偏空'):
+                near_s = a.get('near_support', [])
+                near_r = a.get('near_resistance', [])
+                atr_4h = a.get('indicators', {}).get('4H', {}).get('atr', 0)
+                entry = float(entry_price) if entry_price else 0
+                if near_s and near_r and atr_4h and entry > 0:
+                    if position == '偏多':
+                        sl_s = near_s[-1] if near_s else 0
+                        tp_r = near_r[-1] if near_r else 0
+                        sl = sl_s - atr_4h * 0.5
+                        tp = tp_r
+                    else:
+                        sl_r = near_r[-1] if near_r else 0
+                        tp_s = near_s[-1] if near_s else 0
+                        sl = sl_r + atr_4h * 0.5
+                        tp = tp_s
+                    rr = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+                    if rr < 1.0:
+                        position = '观望（RR过低1:{:.1f}，不开仓）'.format(rr)
             
             # Extract macro_external from extra data (fallback if regime_result not available)
             if not macro_external and 'extra' in a:
@@ -2142,20 +2151,20 @@ def main():
             
             record = {
                 "timestamp": _now_bj().strftime("%Y-%m-%dT%H:%M:%S+08:00"),
-                "coin": coin_key,
-                "coin_type": "large",
+                "coin": a['coin'],
+                "coin_type": "large",  # DEAD: always 'large', should be dynamic per coin (L5)
                 "trigger": "manual",
                 "entry_price": float(entry_price) if entry_price else 0,
                 "ticker_price": ticker_price,
                 "change_pct": change_pct,
                 "trend_1h": trend_1h,
                 "trend_4h": trend_4h,
-                "trend_3d": trend_1d,
+                "trend_1d": trend_1d,
                 "support": [float(s) for s in sup] if sup else [],
                 "resistance": [float(r) for r in res] if res else [],
                 "near_support": [float(s) for s in near_support] if near_support else [],
                 "near_resistance": [float(r) for r in near_resistance] if near_resistance else [],
-                "recommendation": position,
+                "resonance_label": position,  # ⚠️ 存的是position(方向)非共振，下游勿混淆, 应改为 position_direction
                 "risks": risks,
                 "resonance": a.get('resonance', ''),
                 "risk_warnings": risks,
@@ -2168,12 +2177,10 @@ def main():
                 "macd_h_1h": a.get('macd_h_1h'),
                 "pct_b": a.get('pct_b'),
                 # BUGFIX: macd_h_4h may be None (not missing); (None or 0) safely coerces to 0
-                "macd_trend": "bullish" if (a.get('macd_h_4h') or 0) > 0 else "bearish",
+                "macd_trend": "bullish" if (a.get('macd_h_4h') or 0) > 0 else ("bearish" if (a.get('macd_h_4h') or 0) < 0 else "neutral"),
                 "data_freshness": a.get('data_freshness', {}),
                 "data_selection": data_selection,
                 "close_status": close_status,
-                # Full indicator table (per-TF)
-                "kline_table": kline_table,
                 # Full ticker data
                 "ticker_full": ticker_full,
                 # Full funding data
@@ -2202,10 +2209,8 @@ def main():
                 "position": position,
                 # Lessons warnings
                 "lessons_warnings": lessons_warnings,
-                # Calculated fields for verification
-                "sl_val": sl_val,
-                "tp_val": tp_val,
-                "rr_str": rr_str,
+                # Indicators (multi-timeframe technical data)
+                "indicators": a.get('indicators', {}),
             }
             
             # ── 写入 analyses.json ──

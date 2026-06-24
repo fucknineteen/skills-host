@@ -10,20 +10,87 @@ Jin10 MCP 备用方案 — 缓存 + 硬编码关键事件
   summary = get_key_events_summary()  # 人类可读摘要
 """
 
-import json, os, time
+import json, os, time, logging, tempfile, uuid, ssl
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from _shared import BJT as BJ
 
+logging.basicConfig(level=logging.WARNING, format='%(name)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def _parse_sse_response(raw):
+    """解析 SSE 响应，提取 data: 行内容。"""
+    if raw.startswith("event:") or raw.startswith("data:"):
+        data_lines = [l[5:].lstrip() for l in raw.strip().split('\n') if l.startswith('data:')]
+        return '\n'.join(data_lines)
+    return raw
+
+
+def _rpc(headers, base, payload, extra_headers=None, context=None):
+    """Unified JSON-RPC call helper. Reduces duplication between try_jin10_calendar and try_jin10_mcp_session.
+    
+    Args:
+        headers: dict of HTTP headers
+        base: MCP endpoint URL
+        payload: JSON-RPC payload dict
+        extra_headers: optional dict of extra headers (e.g., Mcp-Session-Id)
+        context: optional SSL context
+    """
+    req = urllib.request.Request(base, data=json.dumps(payload).encode(), headers=headers)
+    if extra_headers:
+        for k, v in extra_headers.items():
+            req.add_header(k, v)
+    resp = urllib.request.urlopen(req, timeout=15, context=context) if context else urllib.request.urlopen(req, timeout=15)
+    raw = resp.read().decode()
+    resp.close()
+    raw = _parse_sse_response(raw)
+    if not raw.strip():
+        return {"result": "ok"}
+    return json.loads(raw)
+
+
+def _make_rpc_fn(headers, base, context=None, capture_sid=False):
+    """Factory for rpc() closure used in try_jin10_calendar and try_jin10_mcp_session.
+    
+    Args:
+        capture_sid: if True, captures Mcp-Session-Id from response headers
+            and attaches _session_id to the result dict.
+    """
+    def rpc(method, params=None, is_notification=False):
+        payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+        if not is_notification:
+            payload["id"] = str(uuid.uuid4())[:8]
+        if capture_sid:
+            # Special handling: need to capture response headers
+            req = urllib.request.Request(base, data=json.dumps(payload).encode(), headers=headers)
+            resp = urllib.request.urlopen(req, timeout=15, context=context)
+            raw = resp.read().decode()
+            resp.close()
+            sid = resp.headers.get("Mcp-Session-Id")
+            raw = _parse_sse_response(raw)
+            if not raw.strip():
+                result = {"result": "ok"}
+            else:
+                result = json.loads(raw)
+            if sid and 'result' in result:
+                result['_session_id'] = sid
+            return result
+        return _rpc(headers, base, payload, context=context)
+    return rpc
+
 CACHE_PATH = os.path.expanduser("~/.hermes/trade_review/data/jin10_calendar_cache.json")
-CACHE_MAX_AGE = 6 * 3600  # 6 hours
+CACHE_MAX_AGE = 2 * 3600  # 2 hours
 
 # === 硬编码关键事件（每月更新一次即可） ===
+# ⚠️ EXPIRY: 事件仅覆盖到2026-09。9月后需手动更新日期。
 # 格式: (日期BJ, 标题, 星级, 重要性)
 HARDCODED_EVENTS = [
     # CPI (每月中旬，周三/周四)
     ("2026-06-11", "美国5月CPI年率", 5, "通胀数据，直接决定加息预期"),
     ("2026-07-15", "美国6月CPI年率", 5, "通胀数据"),
     ("2026-08-12", "美国7月CPI年率", 5, "通胀数据"),
+    ("2026-09-15", "美国8月CPI年率", 5, "通胀数据"),
     
     # FOMC (每6周)
     ("2026-06-18", "美联储利率决议 + 点阵图", 5, "利率路径指引，全年最重要"),
@@ -34,6 +101,7 @@ HARDCODED_EVENTS = [
     ("2026-06-05", "美国5月非农就业报告", 5, "就业数据，影响降息预期"),
     ("2026-07-03", "美国6月非农就业报告", 5, "就业数据"),
     ("2026-08-07", "美国7月非农就业报告", 5, "就业数据"),
+    ("2026-09-04", "美国8月非农就业报告", 5, "就业数据"),
     
     # PPI
     ("2026-06-12", "美国5月PPI年率", 4, "生产者通胀，CPI先行指标"),
@@ -57,63 +125,18 @@ HARDCODED_EVENTS = [
 def try_jin10_calendar():
     """尝试通过 Python 客户端直连金十 MCP 获取日历。
     返回 (events_list, error) — events_list 为 None 表示失败。
+    Uses _jin10_mcp_session() to avoid duplicating token + session logic.
     """
     try:
-        import urllib.request, json as _json, uuid, ssl
+        import json as _json, uuid
         
-        # Read token from config
-        config_path = os.path.expanduser("~/.hermes/config.yaml")
-        token = None
-        with open(config_path) as f:
-            for line in f:
-                if 'Authorization' in line and 'Bearer' in line:
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        token = parts[2].strip('"').strip("'")
-                    break
+        session, err = _jin10_mcp_session()
+        if not session:
+            return None, err
         
-        if not token or len(token) < 10:
-            return None, "token not found or redacted"
+        headers, ctx, base = session
         
-        auth = f"Bearer {token}"
-        base = "https://mcp.jin10.com/mcp"
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "Authorization": auth
-        }
-        ctx = ssl.create_default_context()
-        
-        def rpc(method, params=None, is_notification=False):
-            payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
-            if not is_notification:
-                payload["id"] = str(uuid.uuid4())[:8]
-            req = urllib.request.Request(base, data=_json.dumps(payload).encode(), headers=headers)
-            resp = urllib.request.urlopen(req, timeout=15, context=ctx)
-            sid = resp.headers.get("Mcp-Session-Id")
-            raw = resp.read().decode()
-            resp.close()
-            if raw.startswith("event:") or raw.startswith("data:"):
-                data_lines = [l[6:] for l in raw.strip().split('\n') if l.startswith('data:')]
-                raw = ''.join(data_lines)
-            if not raw.strip():
-                return {"result": "ok"}
-            result = _json.loads(raw)
-            if sid and 'result' in result:
-                result['_session_id'] = sid
-            return result
-        
-        # Initialize
-        init = rpc("initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, 
-                                   "clientInfo": {"name": "hermes-fallback", "version": "1.0"}})
-        if 'error' in init:
-            return None, f"init failed: {init['error']}"
-        
-        sid = init.get('_session_id', '')
-        headers["Mcp-Session-Id"] = sid
-        
-        # Send initialized notification
-        rpc("notifications/initialized", {}, is_notification=True)
+        rpc = _make_rpc_fn(headers, base, context=ctx, capture_sid=True)
         
         # Get calendar
         cal = rpc("tools/call", {"name": "list_calendar", "arguments": {}})
@@ -124,11 +147,12 @@ def try_jin10_calendar():
         return events, None
         
     except Exception as e:
+        logger.warning("try_jin10_calendar failed: %s", e)
         return None, str(e)[:100]
 
 
 def update_cache(events):
-    """将金十日历结果写入缓存文件。"""
+    """将金十日历结果写入缓存文件（原子写入）。"""
     os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
     cache = {
         "updated_at": datetime.now(BJ).isoformat(),
@@ -137,8 +161,12 @@ def update_cache(events):
         "event_count": len(events),
         "events": events
     }
-    with open(CACHE_PATH, 'w') as f:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json',
+                                     dir=os.path.dirname(CACHE_PATH),
+                                     delete=False, encoding='utf-8') as f:
         json.dump(cache, f, indent=2, ensure_ascii=False)
+        tmp_path = f.name
+    os.replace(tmp_path, CACHE_PATH)
     return True
 
 
@@ -156,7 +184,8 @@ def read_cache():
         is_stale = age > CACHE_MAX_AGE
         
         return cache.get("events", []), is_stale, round(age_hours, 1)
-    except Exception:
+    except Exception as e:
+        logger.warning("read_cache failed: %s", e)
         return None, True, 999
 
 
@@ -220,7 +249,12 @@ def get_key_events_summary():
         return "本周无重大数据事件"
     
     lines = []
-    freshness = "" if fresh else " ⚠️(数据源不可用，使用缓存)"
+    if fresh:
+        freshness = ""
+    elif source == "hardcoded_fallback":
+        freshness = " ⚠️(数据源不可用，使用硬编码备份)"
+    else:
+        freshness = " ⚠️(数据源不可用，使用过期缓存)"
     
     for e in events[:6]:
         stars = "⭐" * e.get("star", 0)
@@ -256,25 +290,30 @@ def check_jin10_health():
 FLASH_CACHE_PATH = os.path.expanduser("~/.hermes/trade_review/data/jin10_flash_cache.json")
 FLASH_CACHE_TTL = 300  # 5 minutes
 
-# 加密相关关键词（用于搜索+过滤）
-CRYPTO_KEYWORDS = [
-    "BTC", "ETH", "比特币", "以太坊", "加密货币", "区块链",
-    "美联储", "加息", "降息", "通胀", "非农", "CPI", "PPI", "PCE",
-    "SEC", "监管", "合规", "稳定币", "DeFi", "ETF",
-    "美元指数", "DXY", "黄金", "美股", "纳指", "标普",
-    "油价", "原油", "中东", "霍尔木兹", "伊朗",
-    "清算", "爆仓", "交易所", "币安", "OKX", "Coinbase",
-    "灰度", "贝莱德", "微策略", "MicroStrategy",
-    "特朗普", "关税", "贸易战", "地缘",
-    "日本央行", "欧洲央行", "英国央行",
-]
+# 加密+宏观关键词权重表（用于快讯关联度评分）
+# weight: 3=高权重(直接相关), 1=中权重(间接相关)
+CRYPTO_KEYWORD_WEIGHTS = {
+    # 高权重 — 加密货币核心 + 宏观核心
+    "BTC": 3, "ETH": 3, "比特币": 3, "以太坊": 3, "加密货币": 3, "区块链": 3,
+    "美联储": 3, "加息": 3, "降息": 3, "通胀": 3, "非农": 3,
+    "CPI": 3, "PPI": 3, "PCE": 3, "SEC": 3,
+    "美元指数": 3, "DXY": 3, "中东": 3, "霍尔木兹": 3, "油价": 3, "原油": 3,
+    # 中权重 — 加密生态 + 宏观外围
+    "黄金": 1, "美股": 1, "纳指": 1, "标普": 1,
+    "监管": 1, "合规": 1, "稳定币": 1, "DeFi": 1, "ETF": 1,
+    "伊朗": 1, "地缘": 1,
+    "清算": 1, "爆仓": 1, "交易所": 1, "币安": 1, "OKX": 1, "Coinbase": 1,
+    "灰度": 1, "贝莱德": 1, "微策略": 1, "MicroStrategy": 1,
+    "特朗普": 1, "关税": 1, "贸易战": 1,
+    "日本央行": 1, "欧洲央行": 1, "英国央行": 1,
+}
 
 # 黑名单关键词（不关联加密的快讯排除）
 FLASH_BLACKLIST = [
     "A股", "上证", "深证", "创业板", "科创板", "港股午评", "港股收评",
     "IPO", "新股", "打新", "上市辅导",
     "票房", "端午", "出游", "外卖",
-    "芯片", "存储芯片", "半导体" "英韧科技",
+    "芯片", "存储芯片", "半导体", "英韧科技",
     "固态硬盘", "宁德时代", "联想集团", "熊猫债",
     "BTC原油", "BTC管道", "杰伊汉", "阿塞拜疆",
 ]
@@ -284,17 +323,21 @@ def _jin10_mcp_session():
     """建立金十 MCP 会话，返回 (headers_dict, error_msg)。
     共享给 calendar 和 flash 调用，避免重复鉴权。"""
     try:
-        import urllib.request, json as _json, uuid, ssl
+        import json as _json, uuid, ssl
 
-        config_path = os.path.expanduser("~/.hermes/config.yaml")
-        token = None
-        with open(config_path) as f:
-            for line in f:
-                if 'Authorization' in line and 'Bearer' in line:
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        token = parts[2].strip('"').strip("'")
-                    break
+        # Token resolution order: env var → config.yaml → fail
+        token = os.environ.get('JIN10_TOKEN')
+        if not token:
+            config_path = os.path.expanduser("~/.hermes/config.yaml")
+            try:
+                import yaml
+                with open(config_path) as f:
+                    cfg = yaml.safe_load(f)
+                auth = cfg.get("mcp_servers", {}).get("jin10", {}).get("headers", {}).get("Authorization", "")
+                if auth.startswith("Bearer "):
+                    token = auth[7:]
+            except Exception as e:
+                logger.warning("Failed to read token from config.yaml: %s", e)
 
         if not token or len(token) < 10:
             return None, "token not found or redacted"
@@ -303,30 +346,14 @@ def _jin10_mcp_session():
         base = "https://mcp.jin10.com/mcp"
         headers = {
             "Content-Type": "application/json",
+            # Accept: SSE for MCP streaming protocol compatibility with jin10 backend
             "Accept": "application/json, text/event-stream",
             "Authorization": auth
         }
         ctx = ssl.create_default_context()
 
-        def rpc(method, params=None, is_notification=False):
-            payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
-            if not is_notification:
-                payload["id"] = str(uuid.uuid4())[:8]
-            req = urllib.request.Request(base, data=_json.dumps(payload).encode(), headers=headers)
-            resp = urllib.request.urlopen(req, timeout=15, context=ctx)
-            sid = resp.headers.get("Mcp-Session-Id")
-            raw = resp.read().decode()
-            resp.close()
-            if raw.startswith("event:") or raw.startswith("data:"):
-                data_lines = [l[6:] for l in raw.strip().split('\n') if l.startswith('data:')]
-                raw = ''.join(data_lines)
-            if not raw.strip():
-                return {"result": "ok"}
-            result = _json.loads(raw)
-            if sid and 'result' in result:
-                result['_session_id'] = sid
-            return result
-
+        rpc = _make_rpc_fn(headers, base, context=ctx, capture_sid=True)
+        
         # Initialize
         init = rpc("initialize", {
             "protocolVersion": "2025-11-25",
@@ -342,6 +369,7 @@ def _jin10_mcp_session():
 
         return (headers, ctx, base), None
     except Exception as e:
+        logger.warning("jin10_mcp_session init failed: %s", e)
         return None, str(e)[:100]
 
 
@@ -349,7 +377,7 @@ def try_jin10_flash_paginate(session, cursor=""):
     """拉取一页快讯列表。返回 (items, next_cursor, error)。"""
     headers, ctx, base = session
     try:
-        import urllib.request, json as _json, uuid
+        import json as _json, uuid
         params = {}
         if cursor:
             params["cursor"] = cursor
@@ -364,9 +392,7 @@ def try_jin10_flash_paginate(session, cursor=""):
         resp = urllib.request.urlopen(req, timeout=15, context=ctx)
         raw = resp.read().decode()
         resp.close()
-        if raw.startswith("event:") or raw.startswith("data:"):
-            data_lines = [l[6:] for l in raw.strip().split('\n') if l.startswith('data:')]
-            raw = ''.join(data_lines)
+        raw = _parse_sse_response(raw)
         result = _json.loads(raw)
         if 'error' in result:
             return [], "", f"flash failed: {result['error']}"
@@ -375,6 +401,7 @@ def try_jin10_flash_paginate(session, cursor=""):
         next_cursor = data.get("next_cursor", "")
         return items, next_cursor, None
     except Exception as e:
+        logger.warning("try_jin10_flash_paginate failed: %s", e)
         return [], "", str(e)[:100]
 
 
@@ -382,7 +409,7 @@ def try_jin10_search_flash(session, keyword):
     """搜索快讯。返回 (items, error)。"""
     headers, ctx, base = session
     try:
-        import urllib.request, json as _json, uuid
+        import json as _json, uuid
         payload = {
             "jsonrpc": "2.0",
             "id": str(uuid.uuid4())[:8],
@@ -393,45 +420,34 @@ def try_jin10_search_flash(session, keyword):
         resp = urllib.request.urlopen(req, timeout=15, context=ctx)
         raw = resp.read().decode()
         resp.close()
-        if raw.startswith("event:") or raw.startswith("data:"):
-            data_lines = [l[6:] for l in raw.strip().split('\n') if l.startswith('data:')]
-            raw = ''.join(data_lines)
+        raw = _parse_sse_response(raw)
         result = _json.loads(raw)
         if 'error' in result:
             return [], f"search failed: {result['error']}"
         data = result.get("result", {}).get("structuredContent", {}).get("data", {})
         return data.get("items", []), None
     except Exception as e:
+        logger.warning("try_jin10_search_flash(%s) failed: %s", keyword, e)
         return [], str(e)[:100]
 
 
 def _flash_relevance_score(item):
-    """计算快讯与加密市场的关联度分数。"""
+    """计算快讯与加密市场的关联度分数。
+    使用 CRYPTO_KEYWORD_WEIGHTS 作为关键词权重来源。
+    """
     content = item.get("content", "")
     title = item.get("title", "")
     text = (title + " " + content).lower()
 
     score = 0
-    # 高权重关键词
-    high_weight = ["美联储", "加息", "降息", "通胀", "cpi", "ppi", "pce",
-                   "非农", "btc", "eth", "比特币", "以太坊", "加密货币",
-                   "sec", "dxy", "美元指数", "中东", "霍尔木兹", "油价", "原油"]
-    for kw in high_weight:
+    for kw, weight in CRYPTO_KEYWORD_WEIGHTS.items():
         if kw.lower() in text:
-            score += 3
+            score += weight
 
-    # 中权重关键词
-    mid_weight = ["黄金", "美股", "纳指", "标普", "地缘", "特朗普",
-                  "监管", "关税", "贸易战", "日本央行", "欧洲央行",
-                  "etf", "贝莱德", "微策略", "清算", "爆仓",
-                  "交易所", "币安", "coinbase", "灰度"]
-    for kw in mid_weight:
-        if kw.lower() in text:
-            score += 1
-
-    # 黑名单扣分
+    # 黑名单扣分 (case-insensitive match on original content)
+    content_lower = content.lower()
     for kw in FLASH_BLACKLIST:
-        if kw in content:
+        if kw.lower() in content_lower:
             score -= 10
 
     return score
@@ -445,6 +461,7 @@ def fetch_flash_news():
     按关联度排序，最多返回 15 条。仅保留最近 7 天快讯。"""
     # 时间截止：7天前
     cutoff = datetime.now(BJ) - timedelta(days=7)
+    ts_parse_failures = 0
 
     # 1. 尝试 MCP 实时
     session, err = _jin10_mcp_session()
@@ -464,10 +481,18 @@ def fetch_flash_news():
                     if url and url not in all_items:
                         # 时间过滤
                         try:
+                            # ⚠️ 金十API返回的time字段格式不确定：可能是ISO带时区、ISO naive、或空格分隔格式
+                            # naive时间戳默认按BJ时区解析（金十服务器为亚洲时区）
                             item_dt = datetime.fromisoformat(t)
+                            if item_dt.tzinfo is None:
+                                item_dt = item_dt.replace(tzinfo=BJ)
+                            elif item_dt.tzinfo != BJ:
+                                item_dt = item_dt.astimezone(BJ)
                             if item_dt < cutoff:
                                 continue
-                        except Exception:
+                        except Exception as e:
+                            ts_parse_failures += 1
+                            logger.debug("flash paginate timestamp parse failed: %s", e)
                             continue
                         score = _flash_relevance_score(item)
                         if score > 0:
@@ -475,8 +500,8 @@ def fetch_flash_news():
                 if not next_cursor:
                     break
                 cursor = next_cursor
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("flash pagination fetch error: %s", e)
 
         # 搜索高优先级关键词 (独立try块，不影响分页结果)
         try:
@@ -490,34 +515,47 @@ def fetch_flash_news():
                     if url and url not in all_items:
                         try:
                             item_dt = datetime.fromisoformat(t)
+                            if item_dt.tzinfo is None:
+                                item_dt = item_dt.replace(tzinfo=BJ)
+                            elif item_dt.tzinfo != BJ:
+                                item_dt = item_dt.astimezone(BJ)
                             if item_dt < cutoff:
                                 continue
-                        except Exception:
-                            continue
+                        except Exception as e:
+                            logger.debug("flash search timestamp parse failed: %s", e)
                         score = _flash_relevance_score(item) + 2  # 搜索命中加分
                         if score > 0:
                             all_items[url] = {**item, "relevance_score": score}
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("flash search fetch error: %s", e)
 
-        # 有结果才继续
-        if all_items:
-            # 排序：关联度降序，取前 15
-            sorted_items = sorted(all_items.values(), key=lambda x: x.get("relevance_score", 0), reverse=True)[:15]
+        if ts_parse_failures > 0:
+            logger.info("flash timestamp parse failures: %d items skipped", ts_parse_failures)
 
-            # 写入缓存
-            os.makedirs(os.path.dirname(FLASH_CACHE_PATH), exist_ok=True)
-            cache = {
-                "updated_at": datetime.now(BJ).isoformat(),
-                "updated_at_ts": time.time(),
-                "source": "jin10_mcp",
-                "count": len(sorted_items),
-                "items": sorted_items
-            }
-            with open(FLASH_CACHE_PATH, 'w') as f:
-                json.dump(cache, f, indent=2, ensure_ascii=False)
+        # 排序：关联度降序，取前 15（即使空列表也写入缓存，防止过期缓存被重复使用）
+        sorted_items = sorted(all_items.values(), key=lambda x: x.get("relevance_score", 0), reverse=True)[:15] if all_items else []
 
-            return sorted_items, "jin10_live", True
+        # 始终写入缓存（即使为空，防止过期缓存被重复使用）
+        os.makedirs(os.path.dirname(FLASH_CACHE_PATH), exist_ok=True)
+        cache = {
+            "updated_at": datetime.now(BJ).isoformat(),
+            "updated_at_ts": time.time(),
+            "source": "jin10_mcp",
+            "count": len(sorted_items),
+            "items": sorted_items
+        }
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json',
+                                         dir=os.path.dirname(FLASH_CACHE_PATH),
+                                         delete=False, encoding='utf-8') as f:
+            json.dump(cache, f, indent=2, ensure_ascii=False)
+            tmp_path = f.name
+        os.replace(tmp_path, FLASH_CACHE_PATH)
+
+        return sorted_items, "jin10_live", True
+
+    else:
+        if err:
+            logger.warning("jin10 MCP session unavailable: %s", err)
 
     # 2. 读缓存
     if os.path.exists(FLASH_CACHE_PATH):
@@ -530,8 +568,8 @@ def fetch_flash_news():
             is_fresh = age < FLASH_CACHE_TTL
             label = f"cache({age_min}m old)"
             return items, label, is_fresh
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("flash cache read error: %s", e)
 
     # 3. 空回退
     return [], "empty", False
@@ -545,7 +583,7 @@ def get_flash_summary(max_items=8):
 
     now_bj = datetime.now(BJ)
     lines = []
-    freshness = "" if fresh else f" ⚠️({source})"
+    freshness = "" if fresh else " ⚠️(数据源不可用，使用缓存)"
 
     for item in items[:max_items]:
         content = item.get("content", "")
@@ -554,11 +592,16 @@ def get_flash_summary(max_items=8):
         # 截断过长的内容
         if len(content) > 120:
             content = content[:117] + "..."
-        # 提取时间（去掉秒和时区）
+        # 提取时间（转为北京时间，去掉秒）
         try:
             dt = datetime.fromisoformat(t)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=BJ)
+            elif dt.tzinfo != BJ:
+                dt = dt.astimezone(BJ)
             time_str = dt.strftime("%m-%d %H:%M")
-        except Exception:
+        except Exception as e:
+            logger.debug("flash summary time parse failed: %s", e)
             time_str = t[:16] if len(t) >= 16 else t
         lines.append(f"  [{time_str}] {content}")
 

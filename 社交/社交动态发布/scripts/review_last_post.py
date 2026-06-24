@@ -108,15 +108,35 @@ def _build_coin_result(coin, entry, direction, path, actual_sl=None):
         verdict = '🟡 横盘震荡'
         verdict_short = '横盘'
     elif change > THRESHOLD:
-        verdict = '✅ 做多正确' if ('做多' in direction and '做空' not in direction) else ('❌ 做空错误' if ('做空' in direction and '做多' not in direction) else '✅')
-        verdict_short = '正确'
+        if '做多' in direction and '做空' not in direction:
+            verdict = '✅ 做多正确'
+        elif '做空' in direction and '做多' not in direction:
+            verdict = '❌ 做空错误'
+        else:
+            verdict = '⚠️ 方向未知（上涨）'
+        verdict_short = '正确' if ('做多' in direction and '做空' not in direction) else ('错误' if ('做空' in direction and '做多' not in direction) else '未知')
     else:
-        verdict = '❌ 做多错误' if ('做多' in direction and '做空' not in direction) else ('✅ 做空正确' if ('做空' in direction and '做多' not in direction) else '❌')
-        verdict_short = '错误'
+        if '做多' in direction and '做空' not in direction:
+            verdict = '❌ 做多错误'
+        elif '做空' in direction and '做多' not in direction:
+            verdict = '✅ 做空正确'
+        else:
+            verdict = '⚠️ 方向未知（下跌）'
+        verdict_short = '错误' if ('做多' in direction and '做空' not in direction) else ('正确' if ('做空' in direction and '做多' not in direction) else '未知')
 
-    # 优先用 direction 中解析出的实际 SL，回退到 entry*0.99
-    sl = actual_sl if actual_sl else entry * 0.99
-    sl_hit = low_val < sl
+    # 优先用 direction 中解析出的实际 SL，回退到 entry*(0.99|1.01)
+    # ⚠️ 精度假设: ±1% 固定回退，SL可能在极端波动中误判
+    if actual_sl:
+        sl = actual_sl
+    elif '做空' in direction:
+        sl = entry * 1.01
+    else:
+        sl = entry * 0.99
+    # 做空 SL 在上方（跌破触发），做多 SL 在下方（涨破触发）
+    if '做空' in direction:
+        sl_hit = path['high'] > sl
+    else:
+        sl_hit = low_val < sl
 
     return verdict, {
         'entry': entry,
@@ -169,6 +189,8 @@ def main():
             post_time_ms = int(post_dt.timestamp() * 1000)
         except Exception:
             pass
+    if not post_time_ms:
+        print('⚠️ Post time missing/unparseable — using all available 48H candles (may not be accurate)')
 
     # 2. Query DB for 1H klines since post time
     db = sqlite3.connect(DB)
@@ -197,7 +219,7 @@ def main():
         rows = db.execute("""
             SELECT ts, high, low, close FROM klines
             WHERE coin=? AND timeframe='1H'
-            ORDER BY ts DESC LIMIT 48
+            ORDER BY ts DESC LIMIT 96
         """, (coin,)).fetchall()
         if not rows:
             print(f'  {coin}: ❌ no 1H data')
@@ -255,6 +277,7 @@ def main():
             'eth_change_pct': round(eth_r.get('change_pct', 0), 2),
             'eth_sl_hit': eth_r.get('sl_hit', False),
             'path_type': btc_r.get('path_type', ''),
+            'eth_path_type': eth_r.get('path_type', ''),
             'btc_high': btc_r.get('high'),
             'btc_low': btc_r.get('low'),
             'btc_high_ts': btc_r.get('high_ts'),

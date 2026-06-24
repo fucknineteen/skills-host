@@ -14,9 +14,12 @@ import sys
 import sqlite3
 import time
 import traceback
-from pathlib import Path
+from datetime import datetime, fromisoformat as _fromisoformat
 
+from pathlib import Path
 BASE = Path('/root/.hermes/trade_review')
+sys.path.insert(0, str(BASE))
+from _shared import BJT
 DB_PATH = BASE / 'okx_klines.db'
 REGIME_DIR = BASE / 'regimes'
 SCRIPTS_DIR = Path('/root/.hermes/scripts')
@@ -126,9 +129,7 @@ for jf in sorted(set(JSON_FILES)):
             keys = []
             for a in (data if isinstance(data, list) else []):
                 try:
-                    from datetime import datetime, timezone, timedelta
-                    BJ = timezone(timedelta(hours=8))
-                    dt = datetime.fromisoformat(a.get('timestamp', ''))
+                    dt = _fromisoformat(a.get('timestamp', ''))
                     keys.append((a.get('coin'), a.get('entry_price'), dt.strftime('%Y-%m-%d')))
                 except (ValueError, TypeError):
                     keys.append((a.get('coin'), a.get('entry_price'), '?'))
@@ -169,7 +170,7 @@ try:
             "SELECT COUNT(*), MAX(datetime(ts/1000,'unixepoch','+8 hours')) FROM klines WHERE coin=? AND timeframe='1D'",
             (coin,)
         ).fetchone()
-        latest_ok = daily[1] and '2026-06-1' in str(daily[1])
+        latest_ok = daily[1] and daily[1].startswith('2026-06')
         check(f"  {coin} 1D", latest_ok,
               f"{daily[0]} days, latest={daily[1]}" if latest_ok else f"stale: latest={daily[1]}")
     
@@ -236,6 +237,8 @@ try:
     actual_dims = set(dims.keys())
     missing = expected_dims - actual_dims
     extra = actual_dims - expected_dims
+    if extra:
+        check(f"  unexpected dims: {extra}", False, f"extra={extra}")
     check("13 dimensions present", len(missing) == 0,
           f"missing={missing}" if missing else f"all 13 OK")
     

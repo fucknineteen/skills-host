@@ -15,7 +15,10 @@ import time
 from datetime import datetime, timezone, timedelta
 from _shared import BJT as BJ
 
-API_KEY = "_0zpTLkEAmpGW7L9mn7RK5PfYp9GSjrC"
+API_KEY = os.environ.get('POLYGON_API_KEY', '')
+if not API_KEY:
+    import warnings
+    warnings.warn('POLYGON_API_KEY not set — Polygon.io cross-verification disabled')
 BASE_URL = "https://api.polygon.io"
 
 # Coin -> Polygon ticker mapping
@@ -26,14 +29,12 @@ COIN_TICKERS = {
     'DOGE': 'X:DOGEUSD',
 }
 
-_last_call = 0
-_MIN_INTERVAL = 12.5  # free tier: 5/min max, generous margin
 _CALL_WINDOW = []
 
 
 def _rate_limit():
     """Free tier: max 5 calls per minute. Sleeps if needed."""
-    global _last_call, _CALL_WINDOW
+    global _CALL_WINDOW
     now = time.time()
     # Remove calls older than 60 seconds
     _CALL_WINDOW = [t for t in _CALL_WINDOW if now - t < 60]
@@ -43,7 +44,6 @@ def _rate_limit():
             time.sleep(wait)
         _CALL_WINDOW = [t for t in _CALL_WINDOW if now + wait - t < 60]
     _CALL_WINDOW.append(now)
-    _last_call = now
 
 
 def _get(url, timeout=10):
@@ -98,7 +98,7 @@ def get_daily_bars(coin='BTC', days=5):
 
     today = datetime.now(BJ).date()
     end = today + timedelta(days=1)
-    start = today - timedelta(days=days + 3)  # extra buffer for weekends
+    start = today - timedelta(days=days + 5)  # extra buffer for weekends
 
     url = (f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/day/"
            f"{start.isoformat()}/{end.isoformat()}?"
@@ -189,9 +189,12 @@ def compare_with_okx(coin='BTC', okx_daily=None):
 
     if okx_daily:
         # Match by date
-        massive_date = datetime.strptime(
-            massive['ts_bj'].split(' ')[0], '%Y-%m-%d'
-        ).date()
+        try:
+            massive_date = datetime.strptime(
+                massive['ts_bj'].split(' ')[0], '%Y-%m-%d'
+            ).date()
+        except (ValueError, IndexError, KeyError):
+            massive_date = None
 
         for row in okx_daily:
             row_date = datetime.fromtimestamp(row['ts'] / 1000, tz=BJ).date()

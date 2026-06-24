@@ -9,10 +9,49 @@ import os
 import sqlite3
 import subprocess
 import sys
-import re
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from _shared import BJT, DB_PATH as _SHARED_DB_PATH, TRADE_DIR, classify_price_path, get_klines, SOCIAL_ANALYSES_PATH
+
+# 已知重大事件关键词（复盘事件检测用）
+KNOWN_EVENT_KEYWORDS = {'ADP', '非农', 'CPI', 'PPI', 'PCE', 'FOMC', '美联储利率决议', 'GDP', 'PMI', 'ISM', 'NFP'}
+
+# 复盘辅助函数
+def _extract_near_bottom(analysis):
+    """统一提取 near_bottom（兼容 flat_old/full_obj 格式）。"""
+    if not analysis:
+        return False
+    nb = analysis.get('near_bottom', False)
+    if isinstance(nb, bool) and nb:
+        return True
+    nb = analysis.get('sentiment', {}).get('near_bottom', False)
+    return isinstance(nb, bool) and nb
+
+def _extract_rsi(analysis, default=50):
+    """统一提取 RSI（full_obj: indicators→rsi, flat_old: rsi_14→rsi_4h）。"""
+    if not analysis:
+        return default
+    ind = analysis.get('indicators', {})
+    rsi = ind.get('4H', {}).get('rsi') if ind else None
+    if rsi is not None:
+        return rsi
+    rsi = analysis.get('rsi_14')
+    if rsi is not None:
+        return rsi
+    return analysis.get('rsi_4h', default)
+
+def _extract_fg(analysis):
+    """统一提取 FG（兼容 flat_old/full_obj 格式）。"""
+    if not analysis:
+        return None
+    macro = analysis.get('macro', {})
+    fg = macro.get('fear_greed') if macro else None
+    if fg is not None:
+        return fg
+    fg = analysis.get('fg_val')
+    if fg is not None:
+        return fg
+    return analysis.get('macro_external', {}).get('fg_actual')
 
 DB_PATH = _SHARED_DB_PATH
 REVIEWS_PATH = f'{TRADE_DIR}/reviews.json'
@@ -53,37 +92,39 @@ def save_lessons_regime_aware(lessons):
     
     # Detect regime and save to regime file (累积追加)
     regime = get_current_regime()
-    if regime:
-        regime_path = f'{REGIME_DIR}/{regime}_lessons.json'
-        try:
-            with open(regime_path, 'r') as f:
-                existing = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            existing = []
-        
-        # Tag new lessons with regime
-        for l in lessons:
-            if 'regime' not in l:
-                l['regime'] = regime
-        
-        # Merge: only add lessons not already in existing (by coin+date+lesson key)
-        existing_keys = {(e.get('coin',''), e.get('date',''), e.get('lesson','')) for e in existing}
-        new_count = 0
-        for l in lessons:
-            key = (l.get('coin',''), l.get('date',''), l.get('lesson',''))
-            if key not in existing_keys:
-                existing.append(l)
-                existing_keys.add(key)
-                new_count += 1
-        
-        with open(regime_path, 'w') as f:
-            json.dump(existing, f, indent=2, ensure_ascii=False)
-        
-        if new_count > 0:
-            print(f"   → 同步到行情类型文件: {regime}_lessons.json (+{new_count}条)")
+    if not regime:
+        regime = 'unknown'
+    regime_path = f'{REGIME_DIR}/{regime}_lessons.json'
+    try:
+        with open(regime_path, 'r') as f:
+            existing = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        existing = []
     
-    # Rebuild lessons.json from all regime files (并集，每次重建，过滤空条目)
+    # Tag new lessons with regime
+    for l in lessons:
+        if 'regime' not in l:
+            l['regime'] = regime
+    
+    # Merge: only add lessons not already in existing (by coin+date+lesson key)
+    existing_keys = {(e.get('coin',''), e.get('date',''), e.get('lesson','')) for e in existing}
+    new_count = 0
+    for l in lessons:
+        key = (l.get('coin',''), l.get('date',''), l.get('lesson',''))
+        if key not in existing_keys:
+            existing.append(l)
+            existing_keys.add(key)
+            new_count += 1
+    
+    with open(regime_path, 'w') as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
+    
+    if new_count > 0:
+        print(f"   → 同步到行情类型文件: {regime}_lessons.json (+{new_count}条)")
+    
+    # Rebuild lessons.json from all regime files (并集，每次重建)
     all_lessons = []
+    required_keys = {'category', 'lesson'}  # relaxed: 'type' not required (old lessons may lack it)
     if os.path.isdir(REGIME_DIR):
         for fname in os.listdir(REGIME_DIR):
             if fname.endswith('_lessons.json'):
@@ -91,24 +132,14 @@ def save_lessons_regime_aware(lessons):
                     with open(os.path.join(REGIME_DIR, fname), 'r') as f:
                         data = json.load(f)
                         if isinstance(data, list):
-                            # 过滤空条目（lesson 文本为空/空白/仅含标点）
-                            valid = [d for d in data if isinstance(d, dict) and d.get('lesson', '').strip() and len(d.get('lesson', '').strip()) > 10]
-                            all_lessons.extend(valid)
+                            for entry in data:
+                                if isinstance(entry, dict) and entry.get('lesson', '').strip() and required_keys.issubset(entry.keys()):
+                                    all_lessons.append(entry)
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
     
     with open(LESSONS_PATH, 'w') as f:
         json.dump(all_lessons, f, indent=2, ensure_ascii=False)
-
-# Direction keywords — priority order matters for mixed signals
-# Bullish indicators (higher priority when combined with bearish)
-BULLISH_WORDS = ['bullish', '多头', '看多', '上升', '偏多', '反弹', 'recovering',
-                 '多头排列', '筑底', '减速筑底', '震荡偏强', '短期多头', '同步筑底']
-# Bearish indicators
-BEARISH_WORDS = ['bearish', '空头', '看空', '下跌', 'oversold', '空头排列',
-                 '下降', '盘整', '震荡偏弱']
-# Conflict keywords: appear in both directions, handled by priority logic
-CONFLICT_WORDS = ['反弹', '回调']  # e.g. "短期反弹遇阻" is bearish, "5连阳反弹" is bullish
 
 def get_okx_server_time():
     """Get OKX server time via curl to avoid system clock drift."""
@@ -130,14 +161,30 @@ def parse_timestamp(ts_str):
     if '+' in ts_str or ts_str.endswith('Z'):
         if ts_str.endswith('Z'):
             ts_str = ts_str.replace('Z', '+00:00')
-        dt = datetime.fromisoformat(ts_str)
+        try:
+            dt = datetime.fromisoformat(ts_str)
+        except (ValueError, TypeError):
+            return None
         if dt.tzinfo is not None:
             return dt.astimezone(timezone.utc)
         return dt.replace(tzinfo=timezone.utc)
     else:
         # Naive datetime → assumed BJ time (UTC+8)
-        dt = datetime.fromisoformat(ts_str)
-        return dt.replace(tzinfo=timezone(timedelta(hours=8))).astimezone(timezone.utc)
+        # 已验证: Jin10/OKX等上游系统均为亚洲时区服务器, naive时间戳默认即东八区, +8转换正确
+        try:
+            dt = datetime.fromisoformat(ts_str)
+        except (ValueError, TypeError):
+            return None
+        return dt.replace(tzinfo=BJT).astimezone(timezone.utc)
+
+
+def get_key_events(analysis):
+    """从分析记录中提取日历/宏观事件列表（兼容 flat_old 和 full_obj 格式）。"""
+    if not analysis:
+        return []
+    return (analysis.get('calendar_events', []) or 
+            analysis.get('macro', {}).get('key_events', []))
+
 
 # Direction keywords
 def detect_direction_from_klines(candles, entry_price):
@@ -170,57 +217,9 @@ def detect_direction_from_klines(candles, entry_price):
             return 'bearish'
         else:
             return 'flat'
+    # has_up=False and has_down=False → 横盘未触发任何方向阈值
+    return 'flat'
 
-
-def detect_direction(trend_str):
-    """Detect bullish/bearish from trend string (mixed CN/EN).
-    DEPRECATED: Kept for backward compatibility with existing analyses.json.
-    New code should use detect_direction_from_klines() instead.
-    """
-    trend_lower = (trend_str or '').lower()
-    
-    # Context-based overrides (bearish takes precedence)
-    bearish_context = ['遇阻', '压制', '射击之星', '顶背离', '派发', 'UTAD', '空头']
-    bullish_context = ['突破', '放量', 'SOS', '吸筹', '支撑', '上升', '偏多', '多头']
-    
-    has_bull = any(w in trend_lower for w in BULLISH_WORDS)
-    has_bear = any(w in trend_lower for w in BEARISH_WORDS)
-    has_conflict = any(w in trend_lower for w in CONFLICT_WORDS)
-    
-    if not has_bull and not has_bear and not has_conflict:
-        return 'neutral'
-    
-    # Bearish context override (highest priority)
-    if any(wc in trend_lower for wc in bearish_context):
-        return 'bearish'
-    # Bullish context override
-    if any(bc in trend_lower for bc in bullish_context):
-        return 'bullish'
-    
-    # Special: "bearish_" prefix
-    if trend_lower.startswith('bearish_'):
-        return 'bearish'
-    
-    # Both sides detected — fall through to keyword strength
-    if has_bull and has_bear:
-        bull_only = any(w in trend_lower for w in ['偏多', '上升', '多头', '突破'])
-        bear_only = any(w in trend_lower for w in ['下降', '盘整', '震荡偏弱'])
-        if bull_only and not bear_only:
-            return 'bullish'
-        if bear_only and not bull_only:
-            return 'bearish'
-        return 'mixed'
-    
-    # Only bullish side
-    if has_bull:
-        return 'bullish'
-    
-    # Only bearish side
-    if has_bear:
-        return 'bearish'
-    
-    # Only conflict words — no context found
-    return 'neutral'
 
 def find_analysis(analyses, coin, review_ts_str):
     """Find matching analysis by coin and closest timestamp."""
@@ -235,9 +234,19 @@ def find_analysis(analyses, coin, review_ts_str):
     
     # Sort by absolute time difference
     coin_analyses.sort(key=lambda a: abs(
-        (parse_timestamp(a.get('timestamp', '')) or review_dt) - review_dt
+        (parse_timestamp(a.get('timestamp', '')) or (review_dt + timedelta(days=365))) - review_dt
     ).total_seconds())
-    return coin_analyses[0]
+    result = coin_analyses[0]
+    # Normalize flat_old → full_obj: ensure downstream keys always exist
+    # flat_old (analyses.json) uses kline_table, no sentiment/macro
+    # full_obj (social_analyses.json) uses indicators, has sentiment/macro
+    if 'kline_table' in result and 'indicators' not in result:
+        result['indicators'] = result.get('kline_table', {})
+    if 'sentiment' not in result:
+        result['sentiment'] = result.get('sentiment', {})
+    if 'macro' not in result:
+        result['macro'] = result.get('macro_external', {})
+    return result
 
 def do_6h_review(review, analysis, now_utc, db):
     """6h preliminary review. Fixed window: [analysis-1h, analysis+7h]."""
@@ -248,7 +257,7 @@ def do_6h_review(review, analysis, now_utc, db):
     if review_ts is None:
         return None
     
-    # Fixed window: analysis-1h to analysis+7h (total 8h, centered on 6h mark)
+    # Fixed window: analysis-1h to analysis+7h (total 8h, centered on +3h mark)
     since_ms = int((review_ts.timestamp() - 3600) * 1000)
     until_ms = int((review_ts.timestamp() + 7 * 3600) * 1000)
     candles_1h = get_klines(db, coin, '1H', since_ms, until_ms, limit=10)
@@ -270,20 +279,23 @@ def do_6h_review(review, analysis, now_utc, db):
     
     # Judge correctness
     verdict_map = {
-        ('flat',): ('横盘震荡', '横盘震荡：波动{pct:+.2f}%，方向未确立'),
         ('bearish', 'down'): ('正确', '方向正确：K线空头→实际跌{pct:+.2f}%'),
         ('bullish', 'up'): ('正确', '方向正确：K线多头→实际涨{pct:+.2f}%'),
         ('bullish', 'down'): ('错误', '方向错误：K线多头→实际跌{pct:+.2f}%'),
         ('bearish', 'up'): ('错误', '方向错误：K线空头→实际涨{pct:+.2f}%'),
+        ('bullish', 'flat'): ('方向未兑现', 'K线多头→实际横盘，方向未兑现'),
+        ('bearish', 'flat'): ('方向未兑现', 'K线空头→实际横盘，方向未兑现'),
+        ('flat', 'up'): ('横盘偏多', 'K线横盘→实际涨{pct:+.2f}%，未确认'),
+        ('flat', 'down'): ('横盘偏空', 'K线横盘→实际跌{pct:+.2f}%，未确认'),
     }
     verdict, reason_template = verdict_map.get((orig_dir, actual_move), ('横盘震荡', '横盘震荡：波动{pct:+.2f}%'))
     reason = reason_template.format(pct=pct_change)
-    
+
     # Check near_bottom / Spring — use objective K-line data
     # Support both flat_old (sentient.spring_confirmed) and full_obj (near_bottom)
     spring_low = 0
     if analysis:
-        spring = analysis.get('sentiment', {}).get('spring_confirmed', False)
+        spring = (analysis.get('sentiment') or {}).get('spring_confirmed', False)
         spring_low = (analysis.get('support') or [0])[0] if spring else 0
         # For full_obj format: use levels_4h.lows[0] as spring_low proxy
         if not spring and 'levels_4h' in analysis and analysis['levels_4h'].get('lows'):
@@ -295,16 +307,21 @@ def do_6h_review(review, analysis, now_utc, db):
             verdict = '错误'
     
     # Check for event-driven context
-    key_events = analysis.get('macro', {}).get('key_events', []) if analysis else []
-    event_note = ''
+    # New format: calendar_events at top level; old format: macro.key_events nested
+    key_events = get_key_events(analysis)
+    event_matches = []
     for ev in key_events:
         ev_str = str(ev)
-        if any(kw in ev_str for kw in ['ADP','非农','CPI','FOMC','ISM','NFP']):
-            event_note = f" [数据事件: {ev_str}]"
+        if any(kw in ev_str for kw in KNOWN_EVENT_KEYWORDS):
+            event_matches.append(ev_str)
+    event_note = f" [数据事件: {'; '.join(event_matches)}]" if event_matches else ''
     
     # === 价格路径分析 ===
     path_type, path_detail = classify_price_path(candles_1h, entry_price)
-    path_note = f" | 路径:{path_type}(前{path_detail['first_half']['change_pct']:+.1f}%后{path_detail['second_half']['change_pct']:+.1f}% 振幅{path_detail['total_range_pct']:.1f}%)"
+    if path_type == 'unknown' or 'error' in path_detail:
+        path_note = f" | 路径:数据不足"
+    else:
+        path_note = f" | 路径:{path_type}(前{path_detail['first_half']['change_pct']:+.1f}%后{path_detail['second_half']['change_pct']:+.1f}% 振幅{path_detail['total_range_pct']:.1f}%)"
     
     review_ts_bj = review_ts.astimezone(BJT)
     
@@ -366,6 +383,12 @@ def do_12h_review(review, analysis, now_utc, db):
     elif orig_dir == 'bullish' and pct_change < -2:
         direction_score = -1
         direction_detail = f"多头方向错误：跌{pct_change:+.2f}%"
+    elif orig_dir == 'flat' and pct_change > 2:
+        direction_score = 1  # K线横盘但实际涨>2%，方向偏多
+        direction_detail = f"横盘未捕捉：涨{pct_change:+.2f}%，方向偏多"
+    elif orig_dir == 'flat' and pct_change < -2:
+        direction_score = 1  # K线横盘但实际跌>2%，方向偏空
+        direction_detail = f"横盘未捕捉：跌{pct_change:+.2f}%，方向偏空"
     else:
         direction_score = 0
         direction_detail = f"横盘震荡：波动{pct_change:+.2f}%，方向未确立"
@@ -378,9 +401,8 @@ def do_12h_review(review, analysis, now_utc, db):
         sentiment = analysis.get('sentiment', {})
         spring = sentiment.get('spring_confirmed', False)
         
-        # For full_obj format, check near_bottom as alternative signal
-        if not spring:
-            spring = analysis.get('near_bottom', False)
+        # 统一使用 _extract_near_bottom（兼容 top-level 和 sentiment.near_bottom）
+        is_near_bottom = _extract_near_bottom(analysis) if not spring else False
         
         if spring and pct_change > 2:
             wyckoff_score = 1
@@ -390,19 +412,28 @@ def do_12h_review(review, analysis, now_utc, db):
             wyckoff_detail = f"Spring疑似失败：价格续跌{pct_change:.2f}%"
         elif spring:
             wyckoff_detail = "横盘震荡：Spring待验证"
+        elif is_near_bottom and pct_change > 2:
+            wyckoff_score = 1
+            wyckoff_detail = f"near_bottom确认有效：价格反弹{pct_change:+.2f}%"
+        elif is_near_bottom and pct_change < -2:
+            wyckoff_score = -1
+            wyckoff_detail = f"near_bottom疑似失败：价格续跌{pct_change:.2f}%"
+        elif is_near_bottom:
+            wyckoff_detail = "横盘震荡：near_bottom待验证"
         else:
             # 用K线数据客观检测SOS/Spring/UTAD
             # SOS: 放量阳线突破前高
             has_sos = False
-            if len(candles_1h) >= 3:
-                last_vol = candles_1h[0][5]
-                prev_vols = [c[5] for c in candles_1h[1:4]]
+            if len(candles_1h) >= 4:
+                # candles_1h is ASC (0=oldest), use [-1] for newest candle
+                last_vol = candles_1h[-1][5]
+                prev_vols = [c[5] for c in candles_1h[-4:-1]]
                 avg_vol = sum(prev_vols) / len(prev_vols) if prev_vols else 0
-                last_close = candles_1h[0][4]
-                last_open = candles_1h[0][1]
+                last_close = candles_1h[-1][4]
+                last_open = candles_1h[-1][1]
                 if avg_vol > 0 and last_vol > avg_vol * 1.5 and last_close > last_open:
                     # 放量阳线 → 检查是否突破前高
-                    prev_high = max(c[2] for c in candles_1h[1:4])
+                    prev_high = max(c[2] for c in candles_1h[-4:-1])
                     if last_close > prev_high:
                         has_sos = True
                         if pct_change > 2:
@@ -428,11 +459,11 @@ def do_12h_review(review, analysis, now_utc, db):
     support_hits = 0
     resistance_hits = 0
     for s in supports:
-        if isinstance(s, (int, float)):
+        if isinstance(s, (int, float)) and s != 0:
             if abs(window_low - s) / s < 0.005:  # within 0.5%
                 support_hits += 1
     for r in resistances:
-        if isinstance(r, (int, float)):
+        if isinstance(r, (int, float)) and r != 0:
             if abs(window_high - r) / r < 0.005:  # within 0.5%
                 resistance_hits += 1
     
@@ -444,9 +475,6 @@ def do_12h_review(review, analysis, now_utc, db):
         if resistance_hits >= 1:
             parts.append(f"{resistance_hits}阻力")
         levels_detail = f"价位有效：{'+'.join(parts)}触及"
-    elif supports and all(isinstance(s, (int,float)) and window_low < s * 0.995 for s in supports if isinstance(s, (int,float))):
-        levels_score = -1
-        levels_detail = f"支撑位全部失效（最低{window_low}）"
     elif supports or resistances:
         levels_detail = f"价位未触及（支撑最低{window_low},阻力最高{window_high}）"
     else:
@@ -458,13 +486,10 @@ def do_12h_review(review, analysis, now_utc, db):
     events = ""
     event_impact = ""
     if analysis:
-        key_events = analysis.get('macro', {}).get('key_events', []) if 'macro' in analysis else []
-        # For full_obj format, events may come from lessons_warnings
-        if not key_events:
-            key_events = analysis.get('lessons_warnings', [])
+        key_events = get_key_events(analysis)
         events_str = ', '.join(str(e) for e in key_events) if key_events else '无明显事件'
         events = events_str
-        has_event = any(kw in events_str for kw in ['ADP','非农','CPI','FOMC','ISM','NFP'])
+        has_event = any(kw in events_str for kw in KNOWN_EVENT_KEYWORDS)
         event_impact = "数据事件时段，TA参考价值有限" if has_event else "无明显数据事件，TA驱动"
     
     # === 价格路径分析 ===
@@ -522,15 +547,15 @@ def extract_lessons(dir_score, wyckoff_score, levels_score, pct_change,
     
     # direction_misjudge — use actual price change, not text keywords
     if dir_score <= 0:
-        rsi = analysis.get('rsi_14', 0) or analysis.get('rsi_4h', 0)
-        fg = analysis.get('macro', {}).get('fear_greed', 0) if 'macro' in analysis else 0
+        rsi = _extract_rsi(analysis)
+        fg = _extract_fg(analysis)
         
         if dir_score == -1:
-            if rsi and rsi < 20 and fg and fg < 20:
+            if rsi is not None and rsi < 20 and fg is not None and fg < 20:
                 lessons.append({
                     'category': 'direction_misjudge',
                     'type': '方向误判',
-                    'lesson': f"{coin}: 极端超卖(RSI={rsi},FG={fg})环境做空是系统性错误。实际涨{pct_change:+.1f}%。RSI<20+FG<20应自动降级为中性/观望。"
+                    'lesson': f"{coin}: 极端超卖(RSI={rsi},FG={fg})环境{'做空' if pct_change > 0 else '做多'}是系统性错误。实际{'涨' if pct_change > 0 else '跌'}{pct_change:+.1f}%。RSI<20+FG<20应自动降级为中性/观望。"
                 })
             else:
                 actual_label = '涨' if pct_change > 0 else '跌'
@@ -561,15 +586,17 @@ def extract_lessons(dir_score, wyckoff_score, levels_score, pct_change,
                 'lesson': f"{coin}: 威科夫/形态信号在12h窗口内未得到价格确认。该信号在当前环境下效力不足，需更多K线验证。"
             })
     
-    # levels_miss
+    # levels_miss — levels_score can only be 0 or +1, never -1
     if levels_score <= 0:
-        if levels_score == -1:
+        supports = analysis.get('levels_4h', {}).get('lows', []) if analysis else []
+        resistances = analysis.get('levels_4h', {}).get('highs', []) if analysis else []
+        if not supports and not resistances:
             lessons.append({
-                'category': 'levels_miss',
-                'type': '价位误判',
-                'lesson': f"{coin}: 支撑/阻力位全部失效，价格突破关键价位{pct_change:+.1f}%。价位设定需参考更高级别结构。"
+                'category': 'levels_unused',
+                'type': '价位缺失',
+                'lesson': f"{coin}: 12h窗口内无可用支撑/阻力位数据。检查levels_4h是否正常生成。"
             })
-        else:  # levels_score == 0
+        else:
             lessons.append({
                 'category': 'levels_unused',
                 'type': '价位未触及',
@@ -577,13 +604,8 @@ def extract_lessons(dir_score, wyckoff_score, levels_score, pct_change,
             })
     
     # acceleration_miss — use actual K-line drop, not text search
-    # near_bottom: check if sentiment field has it (objective), or use K-line drop
-    has_near_bottom = False
-    if analysis:
-        nb = analysis.get('near_bottom', False)
-        if isinstance(nb, bool) and nb:
-            has_near_bottom = True
-    
+    has_near_bottom = _extract_near_bottom(analysis)
+
     if has_near_bottom and pct_change < -3:
         lessons.append({
             'category': 'acceleration_miss',
@@ -592,11 +614,9 @@ def extract_lessons(dir_score, wyckoff_score, levels_score, pct_change,
         })
     
     # event_miss
-    key_events = analysis.get('macro', {}).get('key_events', []) if 'macro' in analysis else []
-    if not key_events:
-        key_events = analysis.get('lessons_warnings', [])
+    key_events = get_key_events(analysis)
     events_str = ' '.join(str(e) for e in key_events)
-    if any(kw in events_str for kw in ['ADP','非农','CPI','FOMC','ISM','NFP']):
+    if any(kw in events_str for kw in KNOWN_EVENT_KEYWORDS):
         if dir_score in [1, -1]:
             lessons.append({
                 'category': 'event_miss',
@@ -632,7 +652,7 @@ def do_72h_review(review, analysis, now_utc, db):
     
     day1_close = part1[-1][4]
     day2_close = part2[-1][4] if part2 else part1[-1][4]
-    day3_close = part3[-1][4] if part3 else part2[-1][4]
+    day3_close = part3[-1][4] if part3 else (part2[-1][4] if part2 else part1[-1][4])
     
     # High/Low across the entire 72h window
     high_3d = max(c[2] for c in candles_1h)
@@ -679,19 +699,15 @@ def do_72h_review(review, analysis, now_utc, db):
     annotations = []
     lessons = []
     
-    # Check consecutive misjudgment
+    # Check consecutive misjudgment — review_12h is formatted string,
+    # use review_12h_result.direction_score for actual verdict
     review_6h = review.get('review_6h', '')
-    review_12h = review.get('review_12h', '')
-    if review_6h == '错误' and dir_score == -1:
+    r12_result = review.get('review_12h_result', {})
+    if review_6h == '错误' and r12_result.get('direction_score', 0) == -1:
         annotations.append('[WARN] 连续误判: 6h错误+12h错误, 检查分析框架')
     
-    # near_bottom check — use structured field, not text search
-    has_near_bottom = False
-    if analysis:
-        nb = analysis.get('near_bottom', False)
-        if isinstance(nb, bool) and nb:
-            has_near_bottom = True
-    
+    has_near_bottom = _extract_near_bottom(analysis)
+
     if has_near_bottom and low_3d < entry_price * 0.92:  # -8% from entry
         annotations.append('底部判断失败: near_bottom标注后72h内跌幅>8%')
         lessons.append({
@@ -701,25 +717,47 @@ def do_72h_review(review, analysis, now_utc, db):
         })
     
     # Data event check — support both flat_old and full_obj formats
-    key_events = analysis.get('macro', {}).get('key_events', []) if 'macro' in analysis else []
-    if not key_events:
-        key_events = analysis.get('lessons_warnings', [])
+    key_events = get_key_events(analysis)
     events_str = ' '.join(str(e) for e in key_events)
-    if any(kw in events_str for kw in ['ADP','非农','CPI','FOMC','ISM','NFP']):
+    if any(kw in events_str for kw in KNOWN_EVENT_KEYWORDS):
         annotations.append('数据驱动，TA参考价值有限')
     
     # Direction misjudge for 3D
     if trend_3d_score == -1:
         if orig_3d_dir == 'bearish' and net_pct > 3:
-            # Support both flat_old (rsi_14) and full_obj (rsi_4h)
-            rsi = analysis.get('rsi_14', 0) or analysis.get('rsi_4h', 0) if analysis else 0
-            fg = analysis.get('macro', {}).get('fear_greed', 0) if analysis and 'macro' in analysis else 0
-            if rsi and rsi < 20 and fg and fg < 20:
+            rsi = _extract_rsi(analysis)
+            fg = _extract_fg(analysis)
+            if rsi is not None and rsi < 20 and fg is not None and fg < 20:
                 lessons.append({
                     'category': 'direction_misjudge',
                     'type': '方向误判',
                     'lesson': f"{coin}: 3D空头完全错误——72h涨{net_pct:+.1f}%。"
                               f"RSI={rsi}+FG={fg}极端超卖是V反信号而非做空信号。"
+                })
+            else:
+                # FIX: 空头误判但非极端条件也有 lesson
+                lessons.append({
+                    'category': 'direction_misjudge',
+                    'type': '方向误判',
+                    'lesson': f"{coin}: 3D空头误判——72h涨{net_pct:+.1f}%。"
+                              f"看空方向在72h窗口内被市场否定，需重新评估空头逻辑。"
+                })
+        elif orig_3d_dir == 'bullish' and net_pct < -3:
+            rsi = _extract_rsi(analysis)
+            fg = _extract_fg(analysis)
+            if rsi is not None and rsi > 80 and fg is not None and fg > 80:
+                lessons.append({
+                    'category': 'direction_misjudge',
+                    'type': '方向误判',
+                    'lesson': f"{coin}: 3D多头完全错误——72h跌{net_pct:+.1f}%。"
+                              f"RSI={rsi}+FG={fg}极端超买是见顶信号而非做多信号。"
+                })
+            else:
+                lessons.append({
+                    'category': 'direction_misjudge',
+                    'type': '方向误判',
+                    'lesson': f"{coin}: 3D多头完全错误——72h跌{net_pct:+.1f}%。"
+                              f"看多方向在72h窗口内被市场否定，需重新评估多头逻辑。"
                 })
     
     # === 价格路径分析（72h全窗口） ===
@@ -757,11 +795,11 @@ def do_72h_review(review, analysis, now_utc, db):
     return result
 
 def dedup_lessons(existing, new):
-    """Dedup by lesson text similarity."""
-    existing_texts = {e.get('lesson', '') for e in existing}
+    """Dedup by (category, lesson) tuple to avoid false matches across categories."""
+    existing_texts = {(e.get('category', ''), e.get('lesson', '')) for e in existing}
     result = []
     for n in new:
-        if n.get('lesson', '') not in existing_texts:
+        if (n.get('category', ''), n.get('lesson', '')) not in existing_texts:
             result.append(n)
     return result
 
@@ -795,10 +833,13 @@ def main():
             if ts:
                 social_keys.add((sa.get('coin', ''), ts.strftime('%Y-%m-%d')))
         # Remove duplicate records from analyses that also appear in social
-        analyses = [a for a in analyses if (
-            (ts := parse_timestamp(a.get('timestamp', ''))) and 
-            (a.get('coin', ''), ts.strftime('%Y-%m-%d')) not in social_keys
-        )]
+        # (walrus-free for compatibility with Python <3.8)
+        filtered = []
+        for a in analyses:
+            ts = parse_timestamp(a.get('timestamp', ''))
+            if ts and (a.get('coin', ''), ts.strftime('%Y-%m-%d')) not in social_keys:
+                filtered.append(a)
+        analyses = filtered
         analyses.extend(social_analyses)
     except (FileNotFoundError, json.JSONDecodeError):
         pass
@@ -828,13 +869,23 @@ def main():
             best = max(items, key=lambda r: (
                 r.get('completed', False),
                 sum(1 for k in ['review_6h','review_12h','review_72h']
-                    if '待复盘' not in str(r.get(k, '')))
+                    if '待复盘' not in str(r.get(k) or '待复盘'))
             ))
-            others = [r for r in items if r is not best]
-            for r in others:
-                reviews.remove(r)
-                dedup_removed += 1
-                print(f"  [Step 0] 去重删除: {r.get('coin')} @ {r.get('timestamp')}")
+            # Use id() to dedup by object identity, avoiding == conflicts
+            # when identical-value duplicates exist (different objects).
+            # ⚠️ LIMITATION: id() is memory-address based. JSON round-trip
+            # (serialize→deserialize) creates new objects with different ids,
+            # so this dedup only works within a single process lifetime.
+            best_id = id(best)
+            to_remove = [r for r in items if id(r) != best_id]
+            if to_remove:
+                remove_ids = {id(r) for r in to_remove}
+                prev_count = len(reviews)
+                reviews[:] = [r for r in reviews if id(r) not in remove_ids]
+                removed = prev_count - len(reviews)
+                dedup_removed += removed
+                for r in to_remove:
+                    print(f"  [Step 0] 去重删除: {r.get('coin')} @ {r.get('timestamp')}")
     
     if dedup_removed > 0:
         modified = True
@@ -849,8 +900,11 @@ def main():
         ts = a.get('timestamp', '')
         if not coin or not ts or coin in SKIP_COINS:
             continue
-        dt = parse_timestamp(ts)
-        date_key = dt.strftime('%Y-%m-%d') if dt else None
+        try:
+            dt = parse_timestamp(ts)
+            date_key = dt.strftime('%Y-%m-%d') if dt else None
+        except (ValueError, AttributeError, TypeError):
+            continue
         if date_key and (coin, date_key) in existing_dates:
             continue  # 同日同币已有复盘记录，跳过
         existing_dates.add((coin, date_key))
@@ -858,9 +912,11 @@ def main():
         # Create pending review entry
         entry_price = a.get('entry_price', 0)
         # For full_obj format, entry_price may be 0; use ticker.last as fallback
-        if not entry_price and 'ticker' in a:
+        # analysis_template.py uses 'ticker_full'; publish_social.py uses 'ticker'
+        ticker = a.get('ticker') or a.get('ticker_full')
+        if not entry_price and ticker is not None and isinstance(ticker, dict):
             try:
-                entry_price = float(a['ticker'].get('last', 0) or 0)
+                entry_price = float(ticker.get('last', 0) or 0)
             except (ValueError, TypeError):
                 pass
         if not entry_price:
@@ -913,6 +969,8 @@ def main():
             if result:
                 review['review_6h'] = result['review_6h']
                 review['review_6h_note'] = result['review_6h_note']
+                review['review_6h_path'] = result.get('review_6h_path', '')
+                review['review_6h_path_detail'] = result.get('review_6h_path_detail', {})
                 if not has_output:
                     output_lines.append(record_header)
                     has_output = True
@@ -977,8 +1035,8 @@ def main():
                     output_lines.append(f"   72h路径: {path_type}(净{pd.get('net_change_pct',0):+.1f}% 振幅{pd.get('total_range_pct',0):.1f}%)"
                                        f" 前{fh.get('change_pct',0):+.1f}% 后{sh.get('change_pct',0):+.1f}%")
                 annotations = rd.get('annotations', [])
-                for a in annotations:
-                    output_lines.append(f"   {a}")
+                for ann in annotations:
+                    output_lines.append(f"   {ann}")
                 
                 new_lessons = rd.get('new_lessons', [])
                 if new_lessons:
@@ -1000,14 +1058,14 @@ def main():
         if os.path.exists(archive_path):
             with open(archive_path) as f:
                 archive = json.load(f)
-        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30)
+        cutoff = now_utc - timedelta(days=30)
         archivable = []
         keep = []
         for r in reviews:
             if r.get('completed'):
                 try:
                     ts = parse_timestamp(r.get('timestamp'))
-                    if ts and ts.replace(tzinfo=None) < cutoff:
+                    if ts and ts < cutoff:
                         archivable.append(r)
                         continue
                 except Exception:
@@ -1032,7 +1090,7 @@ def main():
         save_lessons_regime_aware(lessons)
         
         if output_lines:
-            print(f"=== 复盘处理 | BJ {now_bj.strftime('%Y-%m-%d %H:%M:%S')} (UTC {now_utc.strftime('%Y-%m-%d %H:%M:%S')}) ===\\n")
+            print(f"=== 复盘处理 | BJ {now_bj.strftime('%Y-%m-%d %H:%M:%S')} (UTC {now_utc.strftime('%Y-%m-%d %H:%M:%S')}) ===\n")
             print('\n'.join(output_lines))
             print(f"\n=== 已更新 reviews.json 和 lessons.json ===")
         # else: nothing to deliver (empty stdout = cron SILENT)

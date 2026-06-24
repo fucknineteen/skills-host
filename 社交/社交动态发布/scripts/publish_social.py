@@ -11,7 +11,7 @@
 """
 import os, sys, json, subprocess, time, threading
 from subprocess import TimeoutExpired
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from _shared import BJT, TRADE_DIR
 sys.path.insert(0, TRADE_DIR)
@@ -47,8 +47,8 @@ def step_sync(coins):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=TRADE_DIR)
     except TimeoutExpired:
-        print('  ⚠️ 同步超时，继续执行')
-        return ''
+        print('  ❌ 同步超时，终止发布流程（违反STEP-1合同）')
+        sys.exit(1)
     if r.returncode != 0:
         print(f'  ⚠️ 同步警告: {r.stderr[:200]}')
     print(f'  ✅ 同步完成')
@@ -59,22 +59,27 @@ def step_review():
     """Step 3: 复盘上条动态"""
     print('[3/7] 复盘上条动态...')
     try:
+        env = os.environ.copy()
+        env['PYTHONPATH'] = TRADE_DIR
         r = subprocess.run(['python3', REVIEW_SCRIPT, '--save'],
-            capture_output=True, text=True, timeout=120, cwd=TRADE_DIR)
+            capture_output=True, text=True, timeout=120, cwd=TRADE_DIR, env=env)
     except TimeoutExpired:
-        print('  ⚠️ 复盘超时，继续执行')
-        return ''
+        print('  ❌ 复盘超时，终止发布流程（违反STEP-3合同）')
+        sys.exit(1)
     review_text = r.stdout.strip()
     if review_text:
-        # 提取关键行
+        # 提取关键行 — 保留发帖时间行（含"复盘上条:"）和数据行（含→且不含"复盘上条:"）
+        time_line = ''
         lines = []
         for line in review_text.split('\n'):
             s = line.strip()
-            if s and ('→' in s or 'No posts' in s or '复盘' in s):
+            if '复盘上条:' in s:
+                time_line = s.replace('📋 复盘上条:', '📋 上条').strip()  # 提取时间
+            elif s and '→' in s:
                 lines.append(s)
         if not lines:
             lines = [review_text.split('\n')[-1].strip()] if review_text.strip() else []
-        review_formatted = '\n'.join(lines)
+        review_formatted = time_line + '\n' + '\n'.join(lines) if time_line else '\n'.join(lines)
     else:
         review_formatted = ''
     if review_formatted:
@@ -323,7 +328,8 @@ def main():
                 existing = []
             
             # 去掉当天旧记录，追加新记录 + FG + REVIEW
-            merged = [r for r in existing if not r.get('timestamp', '').startswith(_now_bj().strftime('%Y-%m-%d'))]
+            _today_str = _now_bj().strftime('%Y-%m-%d')  # 一次性快照，避免跨日边界
+            merged = [r for r in existing if not r.get('timestamp', '').startswith(_today_str)]
             
             # 保存 fg_val/fg_label 供写入记录
             _fg_val = fg_val
@@ -344,11 +350,14 @@ def main():
                 except (ValueError, TypeError):
                     entry = 0
                 
-                # 计算止损/止盈 — 统一使用 calc_sl_tp（与 generate_social_draft 同源）&#35;20
-                inds = a.get('indicators', {})
-                atr_4h_val = inds.get('4H', {}).get('atr', entry * 0.02)
+                # SL/TP v062309 — 优先使用 wrapper 已计算的值，回退到 calc_sl_tp
                 pos_dir = a.get('position', '观望')
-                sl_val, tp_val, rr_str = calc_sl_tp(entry, lows, highs, atr_4h_val, pos_dir)
+                if a.get('sl_val') is not None and a.get('sl_val') != 0:
+                    sl_val, tp_val, rr_str = a['sl_val'], a['tp_val'], a['rr_str']
+                else:
+                    inds = a.get('indicators', {})
+                    atr_4h_val = inds.get('4H', {}).get('atr', entry * 0.02)
+                    sl_val, tp_val, rr_str = calc_sl_tp(entry, lows, highs, atr_4h_val, pos_dir)
                 
                 # 提取费率（从 OKX funding API 响应）
                 funding_raw = a.get('funding', {})
@@ -382,6 +391,8 @@ def main():
                     'calendar_events': a.get('calendar_events', []),
                     'flash_news': a.get('flash_news', []),
                     'macro_external': a.get('macro_external', {}),
+                    # order_flow 来自 regime cache（供复盘/核验使用）
+                    'order_flow': regime_result.get('dimensions', {}).get('order_flow', {}),
                     # 底部研判（供 process_reviews 复盘用）
                     'near_bottom': a.get('near_bottom', False),
                     'bottom_note': a.get('bottom_note', '-'),

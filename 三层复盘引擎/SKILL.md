@@ -243,6 +243,84 @@ if output_lines:
 - `publish_social.py` → `social_analyses.json`（full_obj，社交发动态数据）
 - `process_reviews.py` 读取时合并两个文件，按 (coin, date) 去重，social 优先
 
+### ⚠️ 已知陷阱（2026-06-22 全量逻辑审计 — 23项发现，详见 `references/logic-bug-audit-2026-06-22.md`）
+
+以下按严重程度列出关键陷阱，修改代码前务必阅读完整审计报告。
+
+#### 🔴 致命（3项）
+
+**陷阱 5: near_bottom 字段在 social_analyses.json 中缺失**
+- **位置**: `process_reviews.py` L380-381 (12h), L569-573 (lessons), L677-681 (72h)
+- **现象**: `social_analyses.json` 全文搜索 `near_bottom` 结果为 0
+- **影响**: full_obj 来源的所有复盘丢失 near_bottom 相关教训和 72h 严重失败检测
+- **根因**: `publish_social.py` 写入逻辑未包含 `near_bottom` 字段
+
+**陷阱 6: save_lessons_regime_aware() 在 regime=None 时静默丢失教训（✅ 2026-06-22 已修复）**
+- **位置**: L55-58
+- **修复**: `if not regime: regime = 'unknown'` — regime=None 时写入 `unknown_lessons.json` 兜底
+
+**陷阱 7: 恰好 3 根 K 线时 SOS 检测 `max([])` 崩溃**
+- **位置**: L395-404
+- **触发**: `len(candles_1h) == 3` 时 `candles_1h[-4:-1]` 为空列表，`max([])` 抛 ValueError
+- **修复**: 长度检查改为 `>= 4` 或加 `if prev_vols` 守卫
+
+#### 🟡 高/中优先级（8项）
+
+**陷阱 8: find_analysis() 合并后可能返回错误格式分析 — ✅ 已修复 (2026-06-23)**
+- `find_analysis` 仅按 coin 过滤+时间差排序，合并池中 flat_old/full_obj 并存时返回格式不匹配的记录 → macro/Spring/support 全部失效
+- **修复**: `find_analysis()` 末尾新增格式标准化：flat_old 记录自动补充 `indicators`/`sentiment`/`macro` 字段，确保下游始终能访问预期键
+
+**陷阱 9: 12h 事件检测用 lessons_warnings 充当 key_events**
+- L456-463: full_obj 无 `macro.key_events` 时降级为 `lessons_warnings`（教训警告文本），不含 ADP/非农/CPI 等关键词 → 事件豁免失效
+
+**陷阱 10: 72h 缺少多头误判方向教训**
+- L700-711: `trend_3d_score == -1` 只检查 `orig_3d_dir == 'bearish' and net_pct > 3`，漏掉做多但跌>3% 的场景
+
+**陷阱 11: 去重排序 key 中 str(None) 误计为"已完成" — ✅ 已修复 (2026-06-23)**
+- L816-820: `'待复盘' not in str(None)` → True，字段缺失被当作已复盘，可能保留错误记录
+- **修复**: `str(r.get(k, '待复盘'))` → `str(r.get(k) or '待复盘')`，None 时回退到哨兵值
+
+**陷阱 12: verdict_map 缺少 (flat, up) 和 (flat, down) 组合**
+- L273-279: flat 方向+市场移动≥2% 落入 default '横盘震荡'，不记录方向判断失误
+
+**陷阱 13: 6h 事件标注只保留最后一条**
+- L299-304: 循环中 `event_note` 被覆盖而非追加 → 多条数据事件时信息不完整
+
+**陷阱 14: near_bottom → spring 变量后文案写成"Spring确认有效"**
+- L380-385: 语义错误，near_bottom ≠ Spring
+
+**陷阱 15: extract_lessons levels_score=0 不区分"无价位数据"与"价位未触及" — ✅ 已修复 (2026-06-23)**
+- L559-565: 两种根本原因生成同一条误导性教训
+- **修复**: 检查 `levels_4h.lows`/`highs` 是否为空 → 空则生成"价位缺失"教训，非空则生成"价位未触及"教训
+
+#### 🟢 低优先级（6项，详见审计报告）
+- 归档截断用 `datetime.now()` 而非 OKX 时间
+- `parse_timestamp` 硬编码 +8 而非复用 BJT 常量
+- RSI=0 / FG=0 falsy 跳过极端超卖检测
+- `classify_price_path` 中 `first_close` 实取开盘价
+- `detect_direction()` 死代码中空头优先 bias
+- walrus operator 需 Python 3.8+
+
+### 陷阱 16: inject_lessons.py cron 作业因 `_shared` 导入失败 — ✅ 已修复 (2026-06-23)
+
+- **位置**: cron job `c5c20a96c83b`（教训上下文注入，每小时 :05）
+- **现象**: 自 2026-06-22 19:05 起持续报错 `ModuleNotFoundError: No module named '_shared'`
+- **根因**: cron 配置的 `script: "inject_lessons.py"` 解析为 `/root/.hermes/scripts/inject_lessons.py`，该文件 `from _shared import BJT, TRADE_DIR` 但 `_shared.py` 在 `/root/.hermes/trade_review/`，不在 `sys.path`
+- **影响**: 轻量闭环完全失效 — `.lesson_context.txt` 未更新，分析时无法加载近期教训
+- **修复**: 在 `inject_lessons.py` 开头加 `sys.path.insert(0, '/root/.hermes/trade_review')`，或改用 shell wrapper `cd /root/.hermes/trade_review && python3 inject_lessons.py`
+
+### 陷阱 17: .lesson_context.txt 存在大量重复教训 — ✅ 已修复 (2026-06-23)
+
+- **现象**: 同一教训出现 2-3 次（如 CPI 相关教训完全重复两段）
+- **根因**: `inject_lessons.py` 的去重逻辑对跨 `lessons.json` 和 `regimes/*_lessons.json` 的重复条目未生效
+- **修复**: 新增二级去重 `seen_lessons`（归一化空白符后纯文本去重），同时移除 `_social_publish.py` 中重复的 `'SOL'` 关键词
+
+### 陷阱 18: regime_update.sh 完全吞掉 stderr — ✅ 已修复 (2026-06-23)
+
+- **位置**: `/root/.hermes/scripts/regime_update.sh` L6 `python3 regime_detector.py --update 2>/dev/null`
+- **风险**: 数据库损坏、API 失败、模块导入错误等全部静默
+- **修复**: 改为 `2>/tmp/regime_detector_err.log`，错误写入日志文件
+
 ---
 
 ## 与社交动态复盘的区别
@@ -347,15 +425,37 @@ if output_lines:
 7. 探底回升: 低点在前, 净涨>0, 后半段涨>2%
 8. 宽幅震荡: 振幅>5%, 净涨跌<2%
 
-**独立脚本**（不嵌入复盘流程，按需运行）：
+- **独立脚本**（不嵌入复盘流程，按需运行）：
 - `price_path_report.py` — 批量路径分析报告（`--days N --coin COIN`）
-- `review_path_enhancer.py` — 增强器，将路径数据写入已有 reviews.json（`--dry-run` 预览）
+
+**2026-06-23 重构记录**：
+
+### 辅助函数提取（消除重复代码）
+
+| 函数 | 位置 | 用途 |
+|------|------|------|
+| `_extract_near_bottom(analysis)` | `process_reviews.py` | 统一提取 near_bottom（兼容 flat_old/full_obj） |
+| `_extract_rsi(analysis, default=50)` | `process_reviews.py` | 统一提取 RSI（indicators.4H.rsi → rsi_14 → rsi_4h） |
+| `_extract_fg(analysis)` | `process_reviews.py` | 统一提取 FG（macro.fear_greed → fg_val → macro_external.fg_actual） |
+| `KNOWN_EVENT_KEYWORDS` | `process_reviews.py` | 已知重大事件关键词常量集 |
+
+⚠️ **陷阱**：`_extract_rsi`/`_extract_fg` 必须用 `is not None` 而非 `or` 短路——否则 RSI=0/FG=0 会被吞。
+
+### V反检测统一化
+
+`detect_v_reversal(closed_4h, ticker_last)` 已在 `analysis_template.py` 中定义，供 `_social_publish.py` 导入。消除了 4 处重复代码（`analyze_single_coin` ×2 + `extract_direction` + JSON writer）及其导致的 N2 语义分歧。
+
+### 优化统计
+- 删除 2 个 orphan 文件（skills-host-mirror）
+- 净减少 ~85 行重复代码
+- 修复 3 个 Bug（watch_three_factor 死引用 + `or` 吞零 ×2）
 
 **2026-06-19 重构记录**：
 - `detect_direction_from_4h()` 已删除，72h复盘统一使用 `detect_direction_from_klines()` 从1H K线判定
 - `_build_trend_string()` 已删除（不再调用），`detect_direction()` 保留但标记 deprecated
 - 三层复盘全部统一使用 `classify_price_path()` 输出路径信息
 - `review_last_post.py` 已自带路径输出（`path_type` 字段），社交动态"上条复盘"自动携带
+- ~~`review_path_enhancer.py` — 已废弃（功能被 `price_path_report.py` 替代，2026-06-21 删除~~
 
 ## 相关文件
 
@@ -382,6 +482,10 @@ if output_lines:
 - `references/analysis-loss-bug.md` — analyses.json 覆盖导致 12h 复盘丢失教训的 Bug（🟡待修复）
 - `references/github-auto-push.md` — 脚本变更自动推送到 GitHub（cron 每 5 分钟）
 - `references/post-change-github-sync.md` — 代码修改后本地与 GitHub 一致性验证流程
+- `references/auto-push-github-sync-pattern.md` — auto_push 路径拆分坑、全量同步清单、孤立文件检测（2026-06-21 新增）
+- `references/price-path-classification.md` — 价格走势路径分类框架（8种类型判定逻辑）
+- `references/post-change-github-sync.md` — 代码修改后本地与 GitHub 一致性验证流程
+- `references/logic-bug-audit-2026-06-22.md` — 🆕 2026-06-22 全量逻辑审计（23 项 Bug：🔴致命×3 + 🟡高/中×14 + 🟢低×6）
 
 ## 相关技能
 
